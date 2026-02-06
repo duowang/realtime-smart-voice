@@ -265,29 +265,40 @@ class YouTubeMusicPlayer:
     async def _download_to_cache(self, audio_url: str, cached_file: str, song_id: str, video_id: str, title: str, artist: str) -> bool:
         """Download audio to cache file"""
         try:
-            # Download audio to cache file
-            subprocess.run([
+            # Download audio to cache file using async subprocess
+            process = await asyncio.create_subprocess_exec(
                 'ffmpeg', '-i', audio_url, '-acodec', 'mp3', '-ab', '192k',
-                cached_file, '-y'
-            ], capture_output=True, check=True)
-            
+                cached_file, '-y',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+
+            stdout, stderr = await process.communicate()
+
+            if process.returncode != 0:
+                self._log("CACHE_ERROR", f"FFmpeg error downloading {title}: {stderr.decode()}")
+                # Clean up failed download
+                if os.path.exists(cached_file):
+                    try:
+                        os.unlink(cached_file)
+                    except Exception:
+                        pass
+                return False
+
             # Add to cache metadata
             self._cache_song(song_id, video_id, title, artist)
-            
+
             self._log("CACHE_DOWNLOAD", f"Cached: {title} ({song_id})")
             return True
-            
-        except subprocess.CalledProcessError as e:
-            self._log("CACHE_ERROR", f"FFmpeg error downloading {title}: {e}")
+
+        except Exception as e:
+            self._log("CACHE_ERROR", f"Error downloading to cache: {e}")
             # Clean up failed download
             if os.path.exists(cached_file):
                 try:
                     os.unlink(cached_file)
-                except:
-                    pass
-            return False
-        except Exception as e:
-            self._log("CACHE_ERROR", f"Error downloading to cache: {e}")
+                except Exception as cleanup_error:
+                    self._log("CACHE_ERROR", f"Error cleaning up failed download: {cleanup_error}")
             return False
     
     def _play_cached_audio(self, audio_file: str, title: str):
@@ -370,8 +381,8 @@ class YouTubeMusicPlayer:
             try:
                 if pygame.mixer.get_init():
                     pygame.mixer.music.stop()
-            except pygame.error:
-                pass  # Mixer not initialized, ignore
+            except pygame.error as e:
+                self._log("MUSIC_ERROR", f"Pygame mixer stop error: {e}")
             
             # Wait for playback thread to finish
             if self.playback_thread and self.playback_thread.is_alive():
@@ -461,8 +472,8 @@ class YouTubeMusicPlayer:
                 try:
                     if pygame.mixer.get_init():
                         pygame.mixer.music.stop()
-                except pygame.error:
-                    pass  # Mixer not initialized, ignore
+                except pygame.error as e:
+                    self._log("MUSIC_ERROR", f"Pygame mixer stop error: {e}")
                 
                 # Wait for playback thread to finish
                 if self.playback_thread and self.playback_thread.is_alive():
@@ -474,10 +485,10 @@ class YouTubeMusicPlayer:
             try:
                 if pygame.mixer.get_init():
                     pygame.mixer.quit()
-            except pygame.error:
-                pass  # Mixer not initialized, ignore
-            
+            except pygame.error as e:
+                self._log("MUSIC_ERROR", f"Pygame mixer cleanup error: {e}")
+
             self._log("MUSIC_CLEANUP", "YouTube Music player cleaned up")
-            
+
         except Exception as e:
             self._log("MUSIC_ERROR", f"Error during cleanup: {e}")

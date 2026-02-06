@@ -119,8 +119,11 @@ fi
 # Check if Hi Taco wake word file exists (platform-specific)
 PLATFORM_SUFFIX=""
 if [[ "$OSTYPE" == "darwin"* ]]; then
-    # Use generic mac file for both x86 and ARM64
-    PLATFORM_SUFFIX="mac"
+    if [[ "$(uname -m)" == "arm64" ]]; then
+        PLATFORM_SUFFIX="mac_apple"
+    else
+        PLATFORM_SUFFIX="mac"
+    fi
 elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
     if [[ $(uname -m) =~ ^(arm|aarch64) ]]; then
         PLATFORM_SUFFIX="raspberry-pi"

@@ -173,7 +173,7 @@ class MusicCommandHandler:
         else:
             print(f"[{log_type}] {message}")
     
-    async def   is_music_command(self, text: str) -> bool:
+    async def is_music_command(self, text: str) -> bool:
         """
         Check if the text contains a music command
         
@@ -184,17 +184,14 @@ class MusicCommandHandler:
             True if text contains a music command
         """
         text_lower = text.lower().strip()
-        
-        self._log("MUSIC_COMMAND_CHECK", f"Checking text: '{text}' -> '{text_lower}'")
-        
-        # Check all command patterns
+
+        # Check all command patterns — only log on match to reduce noise
         for command_type, patterns in self.command_patterns.items():
             for pattern in patterns:
                 if re.search(pattern, text_lower):
-                    self._log("MUSIC_COMMAND_MATCH", f"Matched pattern '{pattern}' for command type '{command_type}'")
+                    self._log("MUSIC_COMMAND_MATCH", f"Matched '{pattern}' ({command_type}) in: '{text_lower}'")
                     return True
-        
-        self._log("MUSIC_COMMAND_NO_MATCH", "No music command patterns matched")
+
         return False
     
     async def handle_command(self, text: str) -> Dict:

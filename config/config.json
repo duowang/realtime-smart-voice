@@ -1,7 +1,7 @@
 {
   "openai_api_key": null,
   "chatgpt_model": "gpt-4o",
-  "realtime_model": "gpt-4o-mini-realtime-preview-2024-12-17",
+  "realtime_model": "gpt-realtime",
   "language": "en",
   "tts_engine": "openai",
   "tts_model": "tts-1",

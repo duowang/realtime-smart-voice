@@ -460,3 +460,5 @@ MIT License - see [LICENSE](LICENSE) file for details.
 3. Make your changes
 4. Add tests if applicable
 5. Submit a pull request
+
+See [Repository Guidelines](AGENTS.md) for detailed contributor expectations and workflows.

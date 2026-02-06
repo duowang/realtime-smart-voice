@@ -54,8 +54,10 @@ class WakeWordDetector:
             # Map platform to expected .ppn file suffix
             platform_suffix = ""
             if system == "darwin":  # macOS
-                # Use generic mac file for both x86 and ARM64
-                platform_suffix = "mac"
+                if "arm" in machine or "aarch64" in machine:
+                    platform_suffix = "mac_apple"
+                else:
+                    platform_suffix = "mac"
             elif system == "linux":
                 if "arm" in machine or "aarch64" in machine:
                     platform_suffix = "raspberry-pi"
@@ -205,12 +207,26 @@ class WakeWordDetector:
     def cleanup(self):
         """Clean up resources"""
         if self.is_listening:
-            asyncio.create_task(self.stop_listening())
-        
+            # Synchronous cleanup - stop listening directly
+            self.is_listening = False
+            if self.stream:
+                try:
+                    self.stream.stop_stream()
+                    self.stream.close()
+                    self.stream = None
+                except Exception as e:
+                    print(f"Error closing stream during cleanup: {e}")
+
         if self.audio:
-            self.audio.terminate()
-        
+            try:
+                self.audio.terminate()
+            except Exception as e:
+                print(f"Error terminating audio during cleanup: {e}")
+
         if self.porcupine:
-            self.porcupine.delete()
-        
+            try:
+                self.porcupine.delete()
+            except Exception as e:
+                print(f"Error deleting porcupine during cleanup: {e}")
+
         print("Wake word detector cleaned up.")

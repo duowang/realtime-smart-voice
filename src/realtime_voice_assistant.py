@@ -104,29 +104,33 @@ class RealtimeVoiceAssistant:
             self.logger.info(f"{event_type}: {message}")
         except Exception as e:
             print(f"Error logging event: {e}")
-    
-    async def play_wake_word_acknowledgment(self):
-        """Play acknowledgment after wake word detection using static audio file"""
-        print("Wake word detected! Playing acknowledgment...")
+
+    async def _play_audio_file(self, audio_file_path: str, description: str, log_prefix: str):
+        """
+        Shared method to play an audio file
+
+        Args:
+            audio_file_path: Path to the audio file
+            description: Description for logging/printing
+            log_prefix: Prefix for log events (e.g., "WAKE_WORD_ACK", "BYE_BYE")
+        """
+        print(f"{description}...")
         try:
-            # Play the static audio file
-            audio_file_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'audio', 'hi_there.wav')
-            
             # Check if audio file exists
             if not os.path.exists(audio_file_path):
                 print(f"Audio file not found: {audio_file_path}")
-                self._log_event("WAKE_WORD_ACK_ERROR", f"Audio file not found: {audio_file_path}")
+                self._log_event(f"{log_prefix}_ERROR", f"Audio file not found: {audio_file_path}")
                 return
-            
+
             # Load audio file
             audio_data, sample_rate = sf.read(audio_file_path)
-            
+
             # Create PyAudio instance
             p = pyaudio.PyAudio()
-            
+
             # Determine channels
             channels = 1 if len(audio_data.shape) == 1 else audio_data.shape[1]
-            
+
             # Open stream with proper settings
             stream = p.open(
                 format=pyaudio.paFloat32,
@@ -135,36 +139,40 @@ class RealtimeVoiceAssistant:
                 output=True,
                 frames_per_buffer=1024
             )
-            
+
             # Convert to float32 if needed
             if audio_data.dtype != np.float32:
                 audio_data = audio_data.astype(np.float32)
-            
+
             # Ensure audio is in the right range for float32 (-1.0 to 1.0)
             if np.max(np.abs(audio_data)) > 1.0:
                 audio_data = audio_data / np.max(np.abs(audio_data))
-            
+
             # Play audio in chunks to avoid buffer issues
             chunk_size = 1024
             for i in range(0, len(audio_data), chunk_size):
                 chunk = audio_data[i:i + chunk_size]
                 stream.write(chunk.tobytes())
-            
+
             # Cleanup
             stream.stop_stream()
             stream.close()
             p.terminate()
-            
+
             # Add delay after audio playback
             await asyncio.sleep(0.3)
-            
-            print("Starting conversation...")
-            
+
         except Exception as e:
-            print(f"Error playing wake word acknowledgment: {e}")
+            print(f"Error playing {description}: {e}")
             import traceback
             traceback.print_exc()
-            self._log_event("WAKE_WORD_ACK_ERROR", f"Failed to play acknowledgment: {e}")
+            self._log_event(f"{log_prefix}_ERROR", f"Failed to play {description}: {e}")
+
+    async def play_wake_word_acknowledgment(self):
+        """Play acknowledgment after wake word detection using static audio file"""
+        audio_file_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'audio', 'hi_there.wav')
+        await self._play_audio_file(audio_file_path, "Wake word detected! Playing acknowledgment", "WAKE_WORD_ACK")
+        print("Starting conversation...")
     
     async def play_bye_bye_sound(self):
         """Play ByeBye sound after conversation ends (skip if music is playing)"""
@@ -178,67 +186,9 @@ class RealtimeVoiceAssistant:
         except Exception as e:
             print(f"Error checking music status: {e}")
             # Continue with ByeBye sound if we can't check music status
-        
-        print("Playing ByeBye sound...")
-        try:
-            # Play the static audio file
-            audio_file_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'audio', 'bye_bye.wav')
-            
-            # Check if audio file exists
-            if not os.path.exists(audio_file_path):
-                print(f"Audio file not found: {audio_file_path}")
-                self._log_event("BYE_BYE_ERROR", f"Audio file not found: {audio_file_path}")
-                return
-            
-            # Load audio file
-            audio_data, sample_rate = sf.read(audio_file_path)
-            
-            # Create PyAudio instance
-            p = pyaudio.PyAudio()
-            
-            # Determine channels
-            channels = 1 if len(audio_data.shape) == 1 else audio_data.shape[1]
-            
-            # Open stream with proper settings
-            stream = p.open(
-                format=pyaudio.paFloat32,
-                channels=channels,
-                rate=int(sample_rate),
-                output=True,
-                frames_per_buffer=1024
-            )
-            
-            # Convert to float32 if needed
-            if audio_data.dtype != np.float32:
-                audio_data = audio_data.astype(np.float32)
-            
-            # Ensure audio is in the right range for float32 (-1.0 to 1.0)
-            if np.max(np.abs(audio_data)) > 1.0:
-                audio_data = audio_data / np.max(np.abs(audio_data))
-            
-            # Play audio in chunks to avoid buffer issues
-            chunk_size = 1024
-            for i in range(0, len(audio_data), chunk_size):
-                chunk = audio_data[i:i + chunk_size]
-                stream.write(chunk.tobytes())
-            
-            # Cleanup
-            stream.stop_stream()
-            stream.close()
-            p.terminate()
-            
-            # Add delay after audio playback
-            await asyncio.sleep(0.3)
-            
-        except Exception as e:
-            print(f"Error playing ByeBye sound: {e}")
-            import traceback
-            traceback.print_exc()
-            self._log_event("BYE_BYE_ERROR", f"Failed to play ByeBye sound: {e}")
-        
-        # Initialize realtime client if needed
-        if not self.realtime_client.is_connected:
-            await self.realtime_client.initialize()
+
+        audio_file_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'audio', 'bye_bye.wav')
+        await self._play_audio_file(audio_file_path, "Playing ByeBye sound", "BYE_BYE")
     
     async def handle_wake_word_detection(self):
         """Handle wake word detection and start realtime conversation"""
@@ -246,12 +196,10 @@ class RealtimeVoiceAssistant:
             # Play acknowledgment
             await self.play_wake_word_acknowledgment()
             
-            # Start realtime conversation
+            # Start realtime conversation — the hi_there.wav acknowledgment
+            # already greets the user, so no text greeting needed
             await self.realtime_client.start_conversation()
-            
-            # Send initial greeting to start the conversation
-            await self.realtime_client.send_text("Hello! I heard you call me. How can I help you?")
-            
+
             self._log_event("CONVERSATION_START", "Started realtime conversation after wake word")
             
         except Exception as e:
@@ -288,7 +236,7 @@ class RealtimeVoiceAssistant:
                     await self.handle_wake_word_detection()
                     
                     # Wait for conversation to complete or timeout
-                    conversation_timeout = self.config.get("conversation_timeout", 30)
+                    conversation_timeout = self.config.get("conversation_timeout", 120)
                     try:
                         await asyncio.wait_for(
                             self._wait_for_conversation_end(),
