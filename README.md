@@ -1,16 +1,16 @@
 # Realtime Smart Voice Assistant
 
-**🎯 Direct Voice-to-Voice AI Conversations - No Speech-to-Text Transcription Required**
+**🎯 Direct Voice-to-Voice AI Conversations with OpenAI Realtime API**
 **🍓 Optimized for Raspberry Pi - Bring AI Voice to Edge Devices**
 
-A cutting-edge voice assistant powered by OpenAI's Realtime API that enables **direct audio-to-audio conversations** with AI, bypassing traditional speech-to-text-to-speech pipelines for ultra-low latency interactions. **Designed to run efficiently on Raspberry Pi** for edge AI deployments.
+A cutting-edge voice assistant powered by OpenAI's Realtime API that enables **direct audio-to-audio conversations** with AI for low-latency interactions. **Designed to run efficiently on Raspberry Pi** for edge AI deployments.
 
 ## ✨ Key Features
 
-- **🎤 Direct Voice Processing**: OpenAI Realtime API processes audio directly - no text conversion step
+- **🎤 Direct Voice Processing**: OpenAI Realtime API streams input/output audio in real time
 - **⚡ Ultra-Low Latency**: Streaming audio eliminates traditional STT→LLM→TTS delays  
 - **🍓 Raspberry Pi Ready**: Optimized for Pi 4/5 with efficient resource usage and ARM64 support
-- **🎯 Customizable Wake Words**: Default "Hi Taco" wake word (fully customizable with any phrase)  
+- **🎯 Wake Word Detection**: Uses Picovoice Porcupine with platform-specific `.ppn` files
 - **🎵 YouTube Music Integration**: Voice-controlled music playback with intelligent caching
 - **💾 Smart Music Cache**: Local caching reduces playback latency for frequently played songs
 - **🔄 Continuous Conversations**: Natural back-and-forth without re-triggering wake word
@@ -29,7 +29,7 @@ A cutting-edge voice assistant powered by OpenAI's Realtime API that enables **d
 - Apple Silicon Mac (ARM64) / Intel Mac supported
 
 **🔑 API Keys:**
-- OpenAI API key with Realtime API access (currently in beta)
+- OpenAI API key with Realtime API access
 - Picovoice access key (free tier available)
 - Custom wake word file (.ppn) for your platform
 
@@ -37,7 +37,7 @@ A cutting-edge voice assistant powered by OpenAI's Realtime API that enables **d
 
 1. **Clone and navigate to the project:**
    ```bash
-   git clone https://github.com/your-username/realtime-smart-voice.git
+   git clone https://github.com/duowang/realtime-smart-voice.git
    cd realtime-smart-voice
    ```
 
@@ -46,7 +46,7 @@ A cutting-edge voice assistant powered by OpenAI's Realtime API that enables **d
    **🍓 On Raspberry Pi:**
    ```bash
    sudo apt update
-   sudo apt install -y portaudio19-dev python3-pyaudio python3-pip python3-venv
+   sudo apt install -y portaudio19-dev python3-pyaudio python3-pip python3-venv ffmpeg
    
    # Optional: Test your microphone
    sudo apt install -y alsa-utils
@@ -56,15 +56,15 @@ A cutting-edge voice assistant powered by OpenAI's Realtime API that enables **d
    **🐧 On Ubuntu/Debian:**
    ```bash
    sudo apt update  
-   sudo apt install -y portaudio19-dev python3-pyaudio python3-pip python3-venv
+   sudo apt install -y portaudio19-dev python3-pyaudio python3-pip python3-venv ffmpeg
    ```
    
    **🍎 On macOS:**
    ```bash
-   brew install portaudio
+   brew install portaudio ffmpeg
    ```
 
-3. **Get Picovoice Access Key & Custom Wake Word:**
+3. **Get Picovoice Access Key and wake word file:**
 
    **🔑 Step 1: Get Picovoice Access Key**
    1. Go to [Picovoice Console](https://console.picovoice.ai/)
@@ -72,7 +72,7 @@ A cutting-edge voice assistant powered by OpenAI's Realtime API that enables **d
    3. Navigate to "Access Keys" in the dashboard
    4. Copy your access key (starts with a long alphanumeric string)
    
-   **🎤 Step 2: Create Custom Wake Word**
+   **🎤 Step 2: Create/Download Wake Word**
    1. In Picovoice Console, go to "Porcupine" → "Wake Word Engine"
    2. Click "Train Custom Wake Word"
    3. **Enter your desired phrase**:
@@ -86,7 +86,7 @@ A cutting-edge voice assistant powered by OpenAI's Realtime API that enables **d
    5. Train the wake word (takes a few minutes)
    6. Download the `.ppn` file when training completes
    7. **Place the `.ppn` file in your project root directory**
-   8. **Update configuration** (see Wake Word Customization below)
+   8. Name the file using the platform format expected by this project (see Wake Word Setup below)
 
 4. **Set up API keys:**
    
@@ -120,7 +120,7 @@ A cutting-edge voice assistant powered by OpenAI's Realtime API that enables **d
    - Say your wake word (default: "Hi Taco") to start a conversation  
    - The assistant will acknowledge and begin listening
    - Speak naturally - the conversation is real-time
-   - **Custom wake words**: Use any phrase you've trained (see Wake Word Customization)
+   - Wake word file is loaded by platform-specific filename (see Wake Word Setup)
 
 3. **🎵 Control music playback:**
    - **Play music**: "Play [song/artist name]", "Put on some music", "Start playing [song]"
@@ -139,75 +139,56 @@ A cutting-edge voice assistant powered by OpenAI's Realtime API that enables **d
 
 ### Environment Variables (.env file)
 The recommended way to configure API keys:
-```
+```bash
 OPENAI_API_KEY=your_openai_api_key_here
 PORCUPINE_ACCESS_KEY=your_porcupine_access_key_here
-CONVERSATION_TIMEOUT=30
-SILENCE_TIMEOUT=15
-LOG_LEVEL=INFO
 ```
 
 ### Configuration File (config/config.json)
-Additional settings and alternative API key storage:
+Additional settings:
 ```json
 {
+  "openai_api_key": null,
+  "realtime_model": "gpt-realtime",
+  "chatgpt_model": "gpt-4o",
   "conversation_timeout": 30,
   "silence_timeout": 15,
-  "wake_keywords": ["Hi Taco"],
-  "openai_api_key": "optional-if-using-env",
   "porcupine_access_key": "optional-if-using-env"
 }
 ```
 
 **Priority order:** Environment variables (.env) → System environment → config.json
 
-## 🎯 Wake Word Customization
+## 🎯 Wake Word Setup
 
 ### Default Setup
-The project comes configured for "Hi Taco" wake word, but you can use **any custom phrase**:
+The project defaults to the "Hi Taco" wake word and looks for platform-specific `.ppn` filenames.
 
-### Using Your Own Wake Word
-1. **Train your custom wake word** in [Picovoice Console](https://console.picovoice.ai/)
+### Using Your Own Wake Word File
+1. **Train your wake word** in [Picovoice Console](https://console.picovoice.ai/)
 2. **Download the `.ppn` file** for your platform  
 3. **Place it in the project root** directory
-4. **Update the configuration**:
-
-**Method 1: Update config.json**
-```json
-{
-  "wake_keywords": ["Your Custom Phrase"]
-}
-```
-
-**Method 2: Use environment variable**
-```bash
-# Add to your .env file
-WAKE_KEYWORDS=Your Custom Phrase
-```
+4. Name it to match one of the expected patterns below (or update code paths if using a different name)
 
 ### Wake Word File Naming
 The system automatically detects `.ppn` files based on platform:
 
 **Expected filename patterns:**
 ```
-[YourPhrase]_en_raspberry-pi_v3_0_0.ppn    # Raspberry Pi
-[YourPhrase]_en_mac_v3_0_0.ppn             # macOS  
-[YourPhrase]_en_linux-x86_64_v3_0_0.ppn    # Linux
+Hi-Taco_en_raspberry-pi_v3_0_0.ppn   # Raspberry Pi
+Hi-Taco_en_mac_v3_0_0.ppn            # macOS Intel
+Hi-Taco_en_mac_apple_v3_0_0.ppn      # macOS Apple Silicon
+Hi-Taco_en_linux-x86_64_v3_0_0.ppn   # Linux x86_64
 ```
 
-**Examples:**
-```
-Hey-Assistant_en_raspberry-pi_v3_0_0.ppn
-Computer_en_mac_v3_0_0.ppn
-Jarvis_en_linux-x86_64_v3_0_0.ppn
-```
-
-### Best Practices for Custom Wake Words
+### Best Practices
 - **2-3 syllables** work best (e.g., "Hey Taco", "Computer", "Jarvis")
 - **Avoid common words** that might trigger accidentally
 - **Test in your environment** - some phrases work better in noisy conditions
 - **Unique phrases** reduce false positives
 - **Consider your accent** when training
+
+Note: the current code path is hardcoded to look for `Hi-Taco...` filenames. If you use a different phrase filename, rename it to match the expected pattern or update `src/wake_word_detector.py`.
 
 ## 🎵 Music Features
 
@@ -237,10 +218,11 @@ This assistant includes advanced music playback capabilities:
 "Hold on" (pause for conversation)
 ```
 
-**🔄 Navigation (Coming Soon):**
+**🔄 Navigation and Volume (Current Status):**
 ```
-"Next song" / "Skip"
-"Previous song" / "Go back"
+"Next song" / "Skip"            # currently skips by stopping current song
+"Previous song" / "Go back"     # not implemented yet
+"Volume up" / "Volume down"     # not implemented yet
 ```
 
 ### Music Cache System
@@ -257,7 +239,7 @@ realtime-smart-voice/
 ├── src/
 │   ├── realtime_voice_assistant.py    # Main application
 │   ├── wake_word_detector.py          # Picovoice wake word detection
-│   ├── realtime_voice_client.py       # OpenAI Realtime API + Pipecat
+│   ├── realtime_voice_client.py       # OpenAI Realtime API websocket client
 │   ├── music_commands.py              # Voice music command processing
 │   └── youtube_music_player.py        # YouTube Music integration & caching
 ├── config/
@@ -269,7 +251,8 @@ realtime-smart-voice/
 ├── .env                              # Your API keys (create from .env.example)
 ├── .gitignore                        # Git ignore file
 ├── Hi-Taco_en_raspberry-pi_v3_0_0.ppn # Wake word file (Raspberry Pi)
-├── Hi-Taco_en_mac_v3_0_0.ppn         # Wake word file (macOS)
+├── Hi-Taco_en_mac_v3_0_0.ppn         # Wake word file (macOS Intel)
+├── Hi-Taco_en_mac_apple_v3_0_0.ppn   # Wake word file (macOS Apple Silicon)
 ├── [YourWord]_en_[platform]_v3_0_0.ppn # Your custom wake word files
 ├── requirements.txt                   # Python dependencies
 ├── run.sh                            # Startup script
@@ -280,23 +263,21 @@ realtime-smart-voice/
 
 ### Wake Word Detection
 - **Picovoice Porcupine**: Offline, real-time wake word detection
-- **Fully Customizable**: Default "Hi Taco" or any custom phrase you train
 - **Platform-Specific**: Optimized `.ppn` files for each platform (Pi, Mac, Linux)  
 - **Asynchronous Processing**: Non-blocking audio monitoring
 
 ### Direct Audio-to-Audio Processing
-- **OpenAI Realtime API**: Revolutionary beta API that processes voice directly without transcription
-- **No STT/TTS Pipeline**: Eliminates traditional speech-to-text-to-speech conversion delays
-- **Pipecat Framework**: Modern streaming pipeline for real-time AI applications
-- **Voice Activity Detection**: Intelligent audio processing with Silero VAD
-- **True Real-time**: Continuous audio streaming for natural conversation flow
+- **OpenAI Realtime API**: Streaming input/output audio over a persistent websocket
+- **Server VAD**: Built-in turn detection via `server_vad`
+- **Transcription for routing**: Uses `whisper-1` transcription events to detect music/end commands
+- **True real-time**: Continuous audio streaming with barge-in handling
 
 ### Data Flow
 1. **Wake Word Detection**: Continuous monitoring for "Hi Taco" wake word
-2. **Direct Audio Connection**: Realtime API connection established via Pipecat
-3. **Audio-to-Audio Streaming**: Raw audio sent directly to OpenAI (no speech-to-text conversion)
-4. **Real-time AI Processing**: OpenAI processes voice input and generates voice response directly
-5. **Immediate Audio Output**: AI response played back as audio (no text-to-speech conversion)
+2. **Direct Audio Connection**: Realtime API connection established via websocket
+3. **Audio-to-Audio Streaming**: Raw PCM audio sent directly to OpenAI Realtime
+4. **Real-time AI Processing**: OpenAI returns streaming audio responses
+5. **Command Routing**: User transcription events are used for music control and conversation end detection
 6. **Continuous Loop**: Natural conversation flow until timeout or explicit end
 
 ## 🚀 Why This Matters - Revolutionary Voice Processing
@@ -312,14 +293,14 @@ Voice Input → Speech-to-Text → LLM → Text-to-Speech → Voice Output
 ```
 Voice Input ────────────→ Direct AI Processing ────────────→ Voice Output
      ↓                           ↓                              ↓
-  Real-time              No transcription step            Real-time
+  Real-time           Server-side routing help            Real-time
 ```
 
 ### Technical Advantages:
-- **🎯 Direct Audio Processing**: No intermediate text conversion reduces latency by 80%+
+- **🎯 Direct Audio Streaming**: Real-time PCM streaming minimizes latency
 - **🍓 Edge AI Optimization**: Efficient resource usage perfect for Raspberry Pi deployment
 - **🔄 Natural Conversation Flow**: Interruption handling and real-time back-and-forth
-- **📊 Streaming Architecture**: Pipecat framework optimized for real-time AI applications  
+- **📊 Streaming Architecture**: Lightweight websocket client with async tasks
 - **⚡ Asynchronous Design**: Non-blocking audio processing maximizes Pi hardware efficiency
 - **🌐 Offline Wake Words**: Local processing reduces bandwidth and improves privacy
 
@@ -369,17 +350,16 @@ porcupine.delete()
 **🎤 Wake Word File Issues:**
 - **File not found**: Ensure your `.ppn` file is in the project root directory
 - **Wrong platform**: Download the correct `.ppn` file for your platform:
-  - Raspberry Pi: `[YourWord]_en_raspberry-pi_v3_0_0.ppn`
-  - macOS (Intel): `[YourWord]_en_mac_v3_0_0.ppn` 
-  - macOS (Apple Silicon): `[YourWord]_en_mac_v3_0_0.ppn` (ARM64 version)
-  - Linux: `[YourWord]_en_linux-x86_64_v3_0_0.ppn`
+  - Raspberry Pi: `Hi-Taco_en_raspberry-pi_v3_0_0.ppn`
+  - macOS (Intel): `Hi-Taco_en_mac_v3_0_0.ppn`
+  - macOS (Apple Silicon): `Hi-Taco_en_mac_apple_v3_0_0.ppn`
+  - Linux: `Hi-Taco_en_linux-x86_64_v3_0_0.ppn`
 - **Error code 00000136**: Usually indicates access key or platform compatibility issues
 
 **🎯 Custom Wake Word Not Working:**
-- **Check config.json**: Ensure `wake_keywords` matches your trained phrase exactly
-- **Case sensitive**: "Hi Taco" ≠ "hi taco" - match the training exactly  
-- **File naming**: Ensure `.ppn` file name matches your phrase (with hyphens)
-- **Test with default**: Try "Hi Taco" first to verify setup, then switch to custom
+- **File naming**: Ensure the `.ppn` filename matches what the code expects
+- **Test with default**: Try the included "Hi Taco" file first to verify setup
+- **Custom phrase**: rename your custom `.ppn` to the expected `Hi-Taco_en_<platform>_v3_0_0.ppn` filename or update `src/wake_word_detector.py`
 - **Retrain if needed**: Some phrases work better than others in your environment
 
 **Free Tier Limits:**
@@ -427,7 +407,7 @@ print('✅ Pygame audio initialized successfully!')
 ```
 
 ### API Issues
-- Ensure OpenAI API key has access to Realtime API (currently in beta)
+- Ensure OpenAI API key has access to the Realtime API
 - Verify Picovoice access key is valid and not expired  
 - Check internet connection for API calls
 
