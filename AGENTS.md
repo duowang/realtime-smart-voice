@@ -1,11 +1,11 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-The assistant runtime lives in `src/`, with `realtime_voice_assistant.py` orchestrating wake-word detection, OpenAI realtime streaming, and music control via `music_commands.py`, `realtime_voice_client.py`, and `wake_word_detector.py`. Configuration defaults sit in `config/config.json`, audio prompts in `audio/`, and cached media under `music_cache/`. Logs land in `logs/`, while wake-word templates for Picovoice ship in `wake_word_templates/`. Use `run.sh` for end-to-end setup, and keep large assets out of Git—store them in `audio/` or external storage.
+The assistant runtime lives in `src/`, with `realtime_voice_assistant.py` orchestrating wake-word detection, OpenAI realtime streaming, and music control via `music_commands.py`, `realtime_voice_client.py`, and `wake_word_detector.py`. `youtube_music_player.py` handles audio download/playback, thumbnail caching (hi-res album art stored as `*_thumb.jpg`), and ANSI true-color terminal rendering. Configuration defaults sit in `config/config.json`, audio prompts in `audio/`, and cached media (audio + thumbnails) under `music_cache/`. Logs land in `logs/`, while wake-word templates for Picovoice ship in `wake_word_templates/`. Use `run.sh` for end-to-end setup, and keep large assets out of Git—store them in `audio/` or external storage.
 
 ## Build, Test, and Development Commands
 - `python3 -m venv venv && source venv/bin/activate` — create/enter the project virtualenv.
-- `pip install -r requirements.txt` — install runtime dependencies (OpenAI, Porcupine, YouTube Music helpers).
+- `pip install -r requirements.txt` — install runtime dependencies (OpenAI, Porcupine, YouTube Music helpers, Pillow for thumbnails).
 - `./run.sh` — bootstrap dependencies, load `.env`, and launch the realtime assistant.
 - `python src/realtime_voice_assistant.py` — run the core loop when the environment is already prepared.
 

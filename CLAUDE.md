@@ -6,8 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is a real-time smart voice assistant that combines:
 - **Picovoice Porcupine** for wake word detection (offline, real-time)
-- **OpenAI Realtime API** for natural voice conversations (latest beta)
-- **Pipecat Framework** for real-time AI pipeline management
+- **OpenAI Realtime API** (GA) for natural voice conversations via direct WebSocket
 - **Asynchronous Architecture** for responsive, non-blocking audio processing
 
 ## Key Features
@@ -16,7 +15,8 @@ This project provides a modern real-time voice assistant with:
 - **Real-time Processing**: Uses OpenAI Realtime API for immediate voice interactions
 - **Streaming Audio**: Continuous bidirectional audio streams for natural conversation
 - **Low Latency**: Real-time conversation without delays of traditional STT→LLM→TTS pipelines
-- **Modern Framework**: Pipecat for robust real-time AI applications
+- **Music Playback**: YouTube Music integration with voice commands (play, pause, resume, skip)
+- **Album Art Display**: Song thumbnails rendered in terminal using ANSI true-color half-block characters
 - **Asynchronous**: Non-blocking architecture using asyncio throughout
 
 ## Development Commands
@@ -75,15 +75,28 @@ arecord -d 5 test.wav && aplay test.wav
    - High sensitivity (0.9) for responsive detection
 
 3. **RealtimeVoiceClient** (`realtime_voice_client.py`) - Real-time conversation
-   - OpenAI Realtime API integration via Pipecat
-   - Real-time bidirectional audio streaming
-   - Voice Activity Detection (Silero VAD)
-   - Custom response processing and logging
+   - Direct WebSocket connection to OpenAI Realtime API (GA)
+   - Real-time bidirectional audio streaming (PCM 24kHz)
+   - Server-side Voice Activity Detection (server_vad)
+   - Barge-in support (user can interrupt assistant)
+   - Music command detection and routing
+
+4. **MusicCommandHandler** (`music_commands.py`) - Music playback
+   - YouTube Music search and playback via yt-dlp
+   - Voice commands: play, pause, resume, stop, next, etc.
+   - Auto-pause during conversation, auto-resume after
+
+5. **YouTubeMusicPlayer** (`youtube_music_player.py`) - Audio player
+   - Direct yt-dlp download and pygame playback
+   - Queue management and playback controls
+   - Thumbnail download and caching (hi-res via Google CDN URL rewrite)
+   - Terminal album art rendering using ANSI true-color half-block characters
+   - Adaptive sizing based on terminal dimensions (50% of smaller axis)
 
 ### Data Flow
 1. **Continuous Wake Word Monitoring**: Asynchronous audio monitoring for "Hi Taco"
 2. **Wake Word Detection**: Porcupine processes audio frames in real-time
-3. **Conversation Initialization**: Realtime API connection established via Pipecat
+3. **Conversation Initialization**: WebSocket connection established to Realtime API
 4. **Real-time Audio Streaming**: Bidirectional audio with OpenAI Realtime API
 5. **Natural Conversation**: Low-latency back-and-forth interaction
 6. **Automatic Timeout**: Return to wake word detection after inactivity
@@ -113,21 +126,15 @@ Uses a custom "Hi Taco" wake word:
 
 ### OpenAI Realtime API Integration
 
-This project uses OpenAI's latest Realtime API:
-- **Model**: `gpt-4o-realtime-preview-2024-10-01`
+This project uses OpenAI's Realtime API (GA, not beta):
+- **Endpoint**: `wss://api.openai.com/v1/realtime`
+- **Model**: `gpt-realtime` (configurable via `realtime_model` in config)
 - **Voice**: `alloy` (configurable)
-- **Framework**: Pipecat for pipeline management
-- **Processing**: Real-time audio streaming with VAD
-- **Response Handling**: Custom processors for logging and playback
-
-### Pipecat Framework
-
-Leverages Pipecat for real-time AI applications:
-- **Pipeline Architecture**: Modular audio processing pipeline
-- **VAD Integration**: Silero Voice Activity Detection
-- **Service Integration**: OpenAI Realtime service wrapper
-- **Frame Processing**: Custom processors for response handling
-- **Transport Layer**: Audio input/output management
+- **Connection**: Direct WebSocket via `websockets` library (no Pipecat)
+- **Audio Format**: PCM 24kHz, mono, 16-bit
+- **VAD**: Server-side voice activity detection (`server_vad`)
+- **Transcription**: `gpt-4o-mini-transcribe` for input audio transcription
+- **Session Config**: Uses GA API format with nested `audio.input`/`audio.output` objects
 
 ### Asynchronous Architecture
 
@@ -168,24 +175,17 @@ Built entirely on asyncio for maximum responsiveness:
 ### Testing Real-time Components
 When working with real-time audio:
 1. Test on actual hardware (Raspberry Pi preferred)
-2. Verify API access to OpenAI Realtime API (beta access required)
+2. Verify API access to OpenAI Realtime API
 3. Test with various acoustic environments
 4. Monitor latency and responsiveness
 5. Validate conversation flow and timeout handling
 
 ### API Requirements
 OpenAI Realtime API considerations:
-- **Beta Access**: Requires special access to Realtime API
-- **Model Availability**: Currently `gpt-4o-realtime-preview-2024-10-01`
+- **GA Access**: Uses the generally available Realtime API (not beta)
+- **Model**: `gpt-realtime` (configurable)
 - **Rate Limits**: Monitor API usage and implement backoff if needed
 - **Connection Management**: Handle WebSocket connections properly
-
-### Pipecat Integration
-When modifying the Pipecat pipeline:
-- Follow Pipecat's frame-based architecture
-- Implement proper FrameProcessor subclasses
-- Handle both upstream and downstream frame processing
-- Maintain proper frame types (AudioRawFrame, TextFrame, etc.)
 
 ### Asynchronous Programming
 Maintain async/await throughout:
@@ -203,19 +203,25 @@ Maintain async/await throughout:
 ## Dependencies and Requirements
 
 ### Python Packages
-- `pipecat-ai`: Core framework for real-time AI pipelines
-- `openai>=1.3.0`: OpenAI API client with Realtime support
+- `openai>=1.3.0`: OpenAI API client
+- `websockets>=12.0`: WebSocket connection to Realtime API
 - `pvporcupine>=3.0.0`: Picovoice wake word detection
 - `pyaudio>=0.2.11`: Audio input/output
 - `numpy>=1.24.0`: Audio processing
-- `websockets>=12.0`: WebSocket connections for Realtime API
+- `soundfile>=0.12.1`: Audio file reading
+- `python-dotenv>=1.0.0`: Environment variable management
+- `ytmusicapi>=1.3.0`: YouTube Music search
+- `yt-dlp>=2024.1.0`: YouTube audio download
+- `pygame>=2.5.0`: Music playback
+- `requests>=2.31.0`: HTTP requests
+- `Pillow>=10.0.0`: Thumbnail image processing and terminal rendering
 
 ### System Requirements
 - Python 3.8+
 - PortAudio development libraries
 - Working microphone and audio output
 - Internet connection for API access
-- OpenAI Realtime API beta access
+- OpenAI API key with Realtime API access
 
 ### Hardware Recommendations
 - Raspberry Pi 4/5 or modern Linux/macOS system

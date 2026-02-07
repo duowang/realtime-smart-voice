@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 
 import asyncio
-import subprocess
 import threading
 import time
 import os
-import tempfile
+import re
+import sys
+import base64
 import hashlib
 import json
+import subprocess
+import requests
 from datetime import datetime
 from typing import Optional, List, Dict, Callable
 import pygame
 from ytmusicapi import YTMusic
+from PIL import Image
 import yt_dlp
 
 
@@ -32,6 +36,8 @@ class YouTubeMusicPlayer:
         self.is_paused = False
         self.was_paused_for_conversation = False  # Track if music was paused for conversation
         self.playback_thread = None
+        self._tmux_passthrough = None
+        self._logged_tmux_passthrough_hint = False
         
         # Setup music cache directory
         self.cache_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'music_cache')
@@ -77,6 +83,10 @@ class YouTubeMusicPlayer:
     def _get_cached_file_path(self, song_id: str) -> str:
         """Get the file path for a cached song"""
         return os.path.join(self.cache_dir, f"{song_id}.mp3")
+
+    def _get_cached_thumbnail_path(self, song_id: str) -> str:
+        """Get the file path for a cached thumbnail"""
+        return os.path.join(self.cache_dir, f"{song_id}_thumb.jpg")
     
     def _load_metadata(self) -> Dict:
         """Load metadata from cache"""
@@ -106,12 +116,12 @@ class YouTubeMusicPlayer:
                 song_id in metadata and 
                 os.path.getsize(cached_file) > 0)
     
-    def _cache_song(self, song_id: str, video_id: str, title: str, artist: str):
+    def _cache_song(self, song_id: str, video_id: str, title: str, artist: str, thumbnail_url: str = None):
         """Add song to cache metadata"""
         metadata = self._load_metadata()
         current_time = datetime.now()
-        
-        metadata[song_id] = {
+
+        entry = {
             'video_id': video_id,
             'title': title,
             'artist': artist,
@@ -120,25 +130,31 @@ class YouTubeMusicPlayer:
             'play_count': metadata.get(song_id, {}).get('play_count', 0) + 1,
             'last_played': current_time.strftime('%Y-%m-%d %H:%M:%S')
         }
+        if thumbnail_url:
+            entry['thumbnail_url'] = thumbnail_url
+        metadata[song_id] = entry
         self._save_metadata(metadata)
     
     async def search_songs(self, query: str, limit: int = 5) -> List[Dict]:
         """
         Search for songs on YouTube Music
-        
+
         Args:
             query: Search query
             limit: Maximum number of results
-            
+
         Returns:
             List of song dictionaries
         """
         try:
             self._log("MUSIC_SEARCH", f"Searching for: {query}")
-            
-            # Search for songs
-            search_results = self.ytmusic.search(query, filter='songs', limit=limit)
-            
+
+            # Run sync ytmusic search in thread pool to avoid blocking event loop
+            loop = asyncio.get_event_loop()
+            search_results = await loop.run_in_executor(
+                None, lambda: self.ytmusic.search(query, filter='songs', limit=limit)
+            )
+
             songs = []
             for result in search_results:
                 song = {
@@ -146,18 +162,195 @@ class YouTubeMusicPlayer:
                     'title': result.get('title', 'Unknown Title'),
                     'artist': ', '.join([artist['name'] for artist in result.get('artists', [])]) or 'Unknown Artist',
                     'duration': result.get('duration', 'Unknown'),
-                    'thumbnail': result.get('thumbnails', [{}])[0].get('url') if result.get('thumbnails') else None
+                    'thumbnail': self._get_hires_thumbnail_url(result.get('thumbnails', []))
                 }
                 songs.append(song)
-            
+
             self._log("MUSIC_SEARCH_RESULT", f"Found {len(songs)} songs for '{query}'")
             return songs
-            
+
         except Exception as e:
             self._log("MUSIC_ERROR", f"Error searching songs: {e}")
             return []
     
-    async def play_song(self, video_id: str, title: str = "Unknown", artist: str = "Unknown") -> bool:
+    @staticmethod
+    def _get_hires_thumbnail_url(thumbnails: list, size: int = 2000) -> Optional[str]:
+        """Extract highest resolution thumbnail URL, upgrading size params if possible."""
+        if not thumbnails:
+            return None
+        url = thumbnails[-1].get('url', '')
+        if not url:
+            return None
+        # YouTube Music thumbnails use =w{N}-h{N} suffix — replace with larger size
+        url = re.sub(r'=w\d+-h\d+', f'=w{size}-h{size}', url)
+        return url
+
+    async def _download_thumbnail(self, thumbnail_url: str, song_id: str) -> Optional[str]:
+        """Download thumbnail image to cache.
+
+        Returns the path to the cached thumbnail, or None on failure.
+        Re-downloads if the cached version is too small.
+        """
+        thumb_path = self._get_cached_thumbnail_path(song_id)
+        if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
+            try:
+                img = Image.open(thumb_path)
+                if img.width >= 1000:
+                    return thumb_path
+                # Cached thumbnail is low-res, re-download
+            except Exception:
+                pass
+        try:
+            loop = asyncio.get_event_loop()
+            def _fetch():
+                resp = requests.get(thumbnail_url, timeout=10)
+                resp.raise_for_status()
+                with open(thumb_path, 'wb') as f:
+                    f.write(resp.content)
+            await loop.run_in_executor(None, _fetch)
+            if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
+                return thumb_path
+        except Exception as e:
+            self._log("THUMB_ERROR", f"Failed to download thumbnail: {e}")
+        return None
+
+    @staticmethod
+    def _is_iterm2() -> bool:
+        """Check whether output terminal is iTerm2."""
+        term_program = os.getenv("TERM_PROGRAM", "")
+        lc_terminal = os.getenv("LC_TERMINAL", "")
+        return (
+            term_program == "iTerm.app"
+            or lc_terminal.lower() == "iterm2"
+            or bool(os.getenv("ITERM_SESSION_ID"))
+        )
+
+    def _tmux_allows_passthrough(self) -> bool:
+        """Check tmux allow-passthrough setting (cached)."""
+        if not os.getenv("TMUX"):
+            return True
+
+        if self._tmux_passthrough is not None:
+            return self._tmux_passthrough
+
+        try:
+            result = subprocess.run(
+                ["tmux", "show", "-gv", "allow-passthrough"],
+                capture_output=True,
+                text=True,
+                timeout=1,
+                check=False,
+            )
+            value = result.stdout.strip().lower()
+            self._tmux_passthrough = value in {"on", "all"}
+        except Exception:
+            self._tmux_passthrough = False
+
+        return self._tmux_passthrough
+
+    def _emit_iterm2_inline_image(self, image_path: str, width_percent: int = 70):
+        """Emit iTerm2 inline image escape sequence.
+
+        Uses tmux passthrough when running inside tmux.
+        """
+        with open(image_path, "rb") as image_file:
+            image_b64 = base64.b64encode(image_file.read()).decode("ascii")
+
+        name_b64 = base64.b64encode(os.path.basename(image_path).encode("utf-8")).decode("ascii")
+        payload = (
+            f"\033]1337;File=name={name_b64};inline=1;preserveAspectRatio=1;"
+            f"width={width_percent}%;height=auto:{image_b64}\a"
+        )
+
+        # iTerm2 image escape codes need tmux passthrough wrapping.
+        if os.getenv("TMUX"):
+            tmux_payload = payload.replace("\033", "\033\033")
+            sys.stdout.write(f"\033Ptmux;{tmux_payload}\033\\")
+        else:
+            sys.stdout.write(payload)
+        sys.stdout.flush()
+
+    def _render_thumbnail_iterm2(self, thumb_path: str, title: str, artist: str) -> bool:
+        """Render thumbnail via iTerm2's native inline image protocol."""
+        if not self._is_iterm2():
+            return False
+
+        if os.getenv("TMUX") and not self._tmux_allows_passthrough():
+            if not self._logged_tmux_passthrough_hint:
+                self._logged_tmux_passthrough_hint = True
+                self._log(
+                    "THUMB_INFO",
+                    "tmux inline image passthrough is off. Enable with: set -g allow-passthrough on",
+                )
+            return False
+
+        try:
+            print("")  # blank line before
+            self._emit_iterm2_inline_image(thumb_path, width_percent=70)
+            print(f"  \033[1m{title}\033[0m - {artist}")
+            print("")  # blank line after
+            return True
+        except Exception as e:
+            self._log("THUMB_ERROR", f"Failed to render iTerm2 image: {e}")
+            return False
+
+    def _render_thumbnail_in_terminal(self, thumb_path: str, title: str, artist: str):
+        """Render a thumbnail image in the terminal using ANSI colored half-block characters."""
+        try:
+            # Prefer native iTerm2 inline rendering for much higher visual quality.
+            if self._render_thumbnail_iterm2(thumb_path, title, artist):
+                return
+
+            img = Image.open(thumb_path).convert('RGB')
+
+            try:
+                term_size = os.get_terminal_size()
+                term_width = term_size.columns
+                term_height = term_size.lines
+            except OSError:
+                term_width = 80
+                term_height = 24
+
+            aspect = img.height / img.width
+            # 50% of terminal width
+            width_from_cols = int(term_width * 0.5)
+            # 50% of terminal height: each char row = 2 pixel rows
+            height_from_rows = int(term_height * 0.5)
+            width_from_height = int(height_from_rows * 2 / aspect)
+            # Use the smaller constraint so it stays compact in upper-left
+            new_width = min(width_from_cols, width_from_height)
+
+            new_height = int(new_width * aspect)
+            # Make height even for half-block pairing
+            if new_height % 2 != 0:
+                new_height += 1
+            img = img.resize((new_width, new_height), Image.LANCZOS)
+            pixels = img.load()
+
+            lines = []
+            lines.append("")  # blank line before
+            for y in range(0, new_height, 2):
+                row = ""
+                for x in range(new_width):
+                    # Top pixel -> foreground, bottom pixel -> background
+                    r1, g1, b1 = pixels[x, y]
+                    if y + 1 < new_height:
+                        r2, g2, b2 = pixels[x, y + 1]
+                    else:
+                        r2, g2, b2 = r1, g1, b1
+                    # Use upper half block with fg=top, bg=bottom
+                    row += f"\033[38;2;{r1};{g1};{b1}m\033[48;2;{r2};{g2};{b2}m\u2580"
+                row += "\033[0m"
+                lines.append(row)
+            lines.append(f"  \033[1m{title}\033[0m - {artist}")
+            lines.append("")  # blank line after
+
+            output = "\n".join(lines)
+            print(output)
+        except Exception as e:
+            self._log("THUMB_ERROR", f"Failed to render thumbnail: {e}")
+
+    async def play_song(self, video_id: str, title: str = "Unknown", artist: str = "Unknown", thumbnail_url: str = None) -> bool:
         """
         Play a song by video ID (with caching support)
         
@@ -184,23 +377,28 @@ class YouTubeMusicPlayer:
                 self._log("CACHE_HIT", f"Playing cached version: {title}")
                 audio_file = cached_file
                 # Update play count
-                self._cache_song(song_id, video_id, title, artist)
+                self._cache_song(song_id, video_id, title, artist, thumbnail_url)
+                # Fall back to cached thumbnail_url if not provided
+                if not thumbnail_url:
+                    metadata = self._load_metadata()
+                    thumbnail_url = metadata.get(song_id, {}).get('thumbnail_url')
             else:
                 self._log("CACHE_MISS", f"Downloading: {title}")
-                
-                # Download audio stream URL
-                audio_url = await self._get_audio_stream_url(video_id)
-                if not audio_url:
-                    self._log("MUSIC_ERROR", f"Failed to get audio stream for: {title}")
-                    return False
-                
-                # Download to cache
-                if not await self._download_to_cache(audio_url, cached_file, song_id, video_id, title, artist):
+
+                # Download directly with yt-dlp (handles format + conversion)
+                if not await self._download_song(video_id, cached_file):
                     self._log("MUSIC_ERROR", f"Failed to download: {title}")
                     return False
-                
+
+                self._cache_song(song_id, video_id, title, artist, thumbnail_url)
                 audio_file = cached_file
-            
+
+            # Download and display thumbnail
+            if thumbnail_url:
+                thumb_path = await self._download_thumbnail(thumbnail_url, song_id)
+                if thumb_path:
+                    self._render_thumbnail_in_terminal(thumb_path, title, artist)
+
             # Start playback in separate thread
             self.current_song = {
                 'videoId': video_id,
@@ -227,78 +425,52 @@ class YouTubeMusicPlayer:
             self._log("MUSIC_ERROR", f"Error playing song: {e}")
             return False
     
-    async def _get_audio_stream_url(self, video_id: str) -> Optional[str]:
-        """Get audio stream URL using yt-dlp"""
+    async def _download_song(self, video_id: str, output_path: str) -> bool:
+        """Download song directly with yt-dlp (non-blocking).
+
+        Uses yt-dlp's built-in postprocessing to convert to mp3 in one step,
+        avoiding fragile URL extraction + separate ffmpeg calls.
+        """
         try:
-            # Configure yt-dlp options
+            # Strip .mp3 extension — yt-dlp adds it via postprocessor
+            output_base = output_path.rsplit('.', 1)[0] if output_path.endswith('.mp3') else output_path
+
             ydl_opts = {
                 'format': 'bestaudio/best',
+                'outtmpl': f'{output_base}.%(ext)s',
                 'quiet': True,
                 'no_warnings': True,
-                'extractaudio': True,
-                'audioformat': 'mp3',
-                'outtmpl': '-',  # Don't save to file
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }],
             }
-            
-            youtube_url = f"https://www.youtube.com/watch?v={video_id}"
-            
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                # Extract info without downloading
-                info = ydl.extract_info(youtube_url, download=False)
-                
-                # Get the best audio format
-                formats = info.get('formats', [])
-                audio_formats = [f for f in formats if f.get('acodec') != 'none']
-                
-                if audio_formats:
-                    # Sort by audio quality (bitrate)
-                    audio_formats.sort(key=lambda x: x.get('abr', 0) or 0, reverse=True)
-                    best_audio = audio_formats[0]
-                    return best_audio.get('url')
-            
-            return None
-            
-        except Exception as e:
-            self._log("MUSIC_ERROR", f"Error getting audio stream URL: {e}")
-            return None
-    
-    async def _download_to_cache(self, audio_url: str, cached_file: str, song_id: str, video_id: str, title: str, artist: str) -> bool:
-        """Download audio to cache file"""
-        try:
-            # Download audio to cache file using async subprocess
-            process = await asyncio.create_subprocess_exec(
-                'ffmpeg', '-i', audio_url, '-acodec', 'mp3', '-ab', '192k',
-                cached_file, '-y',
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
 
-            stdout, stderr = await process.communicate()
+            youtube_url = f"https://music.youtube.com/watch?v={video_id}"
 
-            if process.returncode != 0:
-                self._log("CACHE_ERROR", f"FFmpeg error downloading {title}: {stderr.decode()}")
-                # Clean up failed download
-                if os.path.exists(cached_file):
-                    try:
-                        os.unlink(cached_file)
-                    except Exception:
-                        pass
-                return False
+            # Run sync yt-dlp download in thread pool to avoid blocking event loop
+            loop = asyncio.get_event_loop()
+            def _download():
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([youtube_url])
 
-            # Add to cache metadata
-            self._cache_song(song_id, video_id, title, artist)
+            await loop.run_in_executor(None, _download)
 
-            self._log("CACHE_DOWNLOAD", f"Cached: {title} ({song_id})")
-            return True
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                self._log("CACHE_DOWNLOAD", f"Downloaded to cache: {output_path}")
+                return True
+
+            self._log("CACHE_ERROR", f"Download produced no output: {output_path}")
+            return False
 
         except Exception as e:
-            self._log("CACHE_ERROR", f"Error downloading to cache: {e}")
-            # Clean up failed download
-            if os.path.exists(cached_file):
+            self._log("CACHE_ERROR", f"Error downloading song: {e}")
+            if os.path.exists(output_path):
                 try:
-                    os.unlink(cached_file)
-                except Exception as cleanup_error:
-                    self._log("CACHE_ERROR", f"Error cleaning up failed download: {cleanup_error}")
+                    os.unlink(output_path)
+                except Exception:
+                    pass
             return False
     
     def _play_cached_audio(self, audio_file: str, title: str):
@@ -454,7 +626,7 @@ class YouTubeMusicPlayer:
             
             # Play the selected song
             song = songs[index]
-            return await self.play_song(song['videoId'], song['title'], song['artist'])
+            return await self.play_song(song['videoId'], song['title'], song['artist'], song.get('thumbnail'))
             
         except Exception as e:
             self._log("MUSIC_ERROR", f"Error playing search result: {e}")

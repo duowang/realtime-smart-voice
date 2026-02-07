@@ -97,7 +97,54 @@ class RealtimeVoiceClient:
                 "type": "session.update",
                 "session": {
                     "type": "realtime",
-                    "instructions": "You are a helpful voice assistant with full music capabilities. I have a built-in music player that can play songs from YouTube Music. When users ask about music, tell them about available music features like 'play [song name]', 'pause', 'resume', 'stop music', 'next song', etc. Never say you cannot play music - I can play any song they request. The music system handles all music commands automatically, so just acknowledge their requests and be encouraging about the music features.",
+                    "instructions": "You are a helpful voice assistant. You only understand and speak English and Chinese (Mandarin). If you hear unclear or noisy audio, assume it is one of these two languages — never interpret it as Korean, Vietnamese, or any other language. You have music tools available — use them whenever the user wants to play, pause, resume, stop, skip music, or check what's playing. Keep responses concise.",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "play_music",
+                            "description": "Search for and play a song or artist from YouTube Music.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "query": {
+                                        "type": "string",
+                                        "description": "The song name, artist, or search query to play"
+                                    }
+                                },
+                                "required": ["query"]
+                            }
+                        },
+                        {
+                            "type": "function",
+                            "name": "pause_music",
+                            "description": "Pause the currently playing music.",
+                            "parameters": {"type": "object", "properties": {}}
+                        },
+                        {
+                            "type": "function",
+                            "name": "resume_music",
+                            "description": "Resume paused music.",
+                            "parameters": {"type": "object", "properties": {}}
+                        },
+                        {
+                            "type": "function",
+                            "name": "stop_music",
+                            "description": "Stop the currently playing music completely.",
+                            "parameters": {"type": "object", "properties": {}}
+                        },
+                        {
+                            "type": "function",
+                            "name": "get_music_status",
+                            "description": "Get the current music playback status (what's playing, paused, etc.).",
+                            "parameters": {"type": "object", "properties": {}}
+                        },
+                        {
+                            "type": "function",
+                            "name": "skip_song",
+                            "description": "Skip the current song.",
+                            "parameters": {"type": "object", "properties": {}}
+                        }
+                    ],
                     "audio": {
                         "input": {
                             "format": {
@@ -105,7 +152,8 @@ class RealtimeVoiceClient:
                                 "rate": 24000
                             },
                             "transcription": {
-                                "model": "whisper-1"
+                                "model": "gpt-4o-mini-transcribe",
+                                "language": "en"
                             },
                             "turn_detection": {
                                 "type": "server_vad",
@@ -224,28 +272,11 @@ class RealtimeVoiceClient:
                 event_type = event.get("type")
                 
                 if event_type == "conversation.item.input_audio_transcription.completed":
-                    # Handle transcription of user input
+                    # Handle transcription of user input (logging + end-phrase detection only)
                     transcript = event.get("transcript", "")
                     if transcript:
                         self._log("USER_TRANSCRIPT", transcript)
-                        
-                        # Check for music commands and handle directly
-                        if await self.music_handler.is_music_command(transcript):
-                            print(f"\n[Music command detected: {transcript}]")
-                            
-                            # Handle music command directly
-                            music_response = await self.music_handler.handle_command(transcript)
-                            print(f"[Music Response: {music_response.get('response', 'Done.')}]")
-                            
-                            # If music started playing, end conversation and return to wake word detection
-                            if music_response.get('action') == 'play' and music_response.get('success'):
-                                print("[Music started - returning to wake word detection mode]")
-                                self.conversation_should_end = True
-                                await self.stop_conversation()
-                                return
 
-                            continue
-                        
                         # Check if user wants to end conversation
                         if self._should_end_conversation(transcript):
                             print("\n[Ending conversation...]")
@@ -284,6 +315,48 @@ class RealtimeVoiceClient:
                     self.is_assistant_speaking = False
                     self._assistant_finished_time = time.time()
                     
+                elif event_type == "response.function_call_arguments.done":
+                    # LLM decided to call a music function
+                    call_id = event.get("call_id", "")
+                    fn_name = event.get("name", "")
+                    raw_args = event.get("arguments", "{}")
+                    try:
+                        fn_args = json.loads(raw_args)
+                    except json.JSONDecodeError:
+                        fn_args = {}
+
+                    self._log("FUNCTION_CALL", f"{fn_name}({fn_args})")
+
+                    # Execute via music handler
+                    result = await self.music_handler.execute(fn_name, fn_args)
+                    result_text = result.get("response", "Done.")
+                    print(f"\n[Function {fn_name}: {result_text}]")
+
+                    # Send function output back to the model
+                    func_output = {
+                        "type": "conversation.item.create",
+                        "item": {
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": json.dumps(result)
+                        }
+                    }
+                    await self.websocket.send(json.dumps(func_output))
+
+                    # If play succeeded, end conversation and return to wake word mode
+                    if result.get("action") == "play" and result.get("success"):
+                        # Let the model acknowledge before ending
+                        await self.websocket.send(json.dumps({"type": "response.create"}))
+                        # Wait briefly for the acknowledgment audio to start
+                        # The conversation will end after silence timeout or next response.done
+                        print("[Music started - will return to wake word detection mode]")
+                        self.conversation_should_end = True
+                        await self.stop_conversation()
+                        return
+                    else:
+                        # Trigger model to respond to the user with the result
+                        await self.websocket.send(json.dumps({"type": "response.create"}))
+
                 elif event_type == "input_audio_buffer.speech_started":
                     # User started speaking — if assistant was mid-response,
                     # this is a barge-in / interruption.
@@ -396,41 +469,6 @@ class RealtimeVoiceClient:
             
         except Exception as e:
             self._log("REALTIME_ERROR", f"Error sending text: {e}")
-    
-    async def _send_music_response(self, response_text: str):
-        """Send music response as assistant message"""
-        if not self.is_connected or not self.websocket:
-            return
-        
-        try:
-            # Create assistant response item
-            conversation_item = {
-                "type": "conversation.item.create",
-                "item": {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "output_text",
-                            "text": response_text
-                        }
-                    ]
-                }
-            }
-            
-            await self.websocket.send(json.dumps(conversation_item))
-            
-            # Trigger TTS response
-            response_create = {
-                "type": "response.create"
-            }
-            
-            await self.websocket.send(json.dumps(response_create))
-            
-            self._log("MUSIC_RESPONSE", f"Sent music response: {response_text}")
-            
-        except Exception as e:
-            self._log("REALTIME_ERROR", f"Error sending music response: {e}")
     
     async def stop_conversation(self):
         """Stop the realtime conversation"""
