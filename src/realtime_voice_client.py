@@ -3,6 +3,7 @@ import base64
 import json
 import logging
 import os
+import re
 import time
 from typing import Callable, Optional
 
@@ -507,16 +508,21 @@ class RealtimeVoiceClient:
             self._log("REALTIME_ERROR", f"Error handling responses: {e}")
     
     def _should_end_conversation(self, text: str) -> bool:
-        """Check if the user wants to end the conversation"""
-        text_lower = text.lower().strip()
+        """End on standalone farewells, not words embedded in music commands."""
+        cleaned = re.sub(r"[^\w\s']", " ", text.casefold().replace("’", "'"))
+        cleaned = " ".join(cleaned.split())
+        cleaned = re.sub(r"^(?:(?:ok|okay|please)\s+)+", "", cleaned)
+        cleaned = re.sub(r"\s+(?:please|thanks|thank you)$", "", cleaned)
+        if cleaned not in self.end_phrases:
+            return False
 
-        # Check for exact matches and partial matches
-        for phrase in self.end_phrases:
-            if phrase in text_lower:
-                self._log("CONVERSATION_END_DETECTED", f"End phrase detected: '{phrase}' in '{text}'")
-                return True
+        # Wake-up has already auto-paused a loaded track. Let the model route a
+        # bare "stop" to stop_music instead of closing and auto-resuming it.
+        if cleaned == "stop" and self.music_handler.get_status().get("is_playing"):
+            return False
 
-        return False
+        self._log("CONVERSATION_END_DETECTED", f"Standalone end phrase detected: '{text}'")
+        return True
 
     def _is_noise_transcript(self, text: str) -> bool:
         """Check if transcript is background noise rather than intentional speech.

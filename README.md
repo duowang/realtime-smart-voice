@@ -106,6 +106,21 @@ make dev-deps
 make check
 ```
 
+### Headless integration test
+
+Use prerecorded speech to test wake → play → wake → pause → wake → resume → wake → stop. This runs the actual sherpa model, OpenAI Realtime command routing, YouTube Music search, and pygame decoding with SDL's silent output device. It needs the normal API key and internet connection, and uses no microphone or speakers.
+
+Provide a mono PCM16 wake recording at 16 kHz, plus `play.wav`, `pause.wav`, `resume.wav`, and `stop.wav` at 24 kHz containing the corresponding spoken commands:
+
+```bash
+venv/bin/python tests/headless_smoke.py \
+  --wake-audio /path/to/hi-taco.wav \
+  --commands-dir /path/to/commands \
+  --report tmp/headless-smoke.json
+```
+
+Add `--background-audio /path/to/music-16k.wav --snr-db 5` to mix music into the wake input during playback. The test checks that playback advances, pause remains effective after the conversation, resume advances again, stop releases the track, and wake detection still works afterward. Reports and personal recordings should stay out of Git. Digital mixtures test masking, but do not reproduce room acoustics or microphone hardware.
+
 ## Configuration
 
 Set the API key in `.env` (recommended):
