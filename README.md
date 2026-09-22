@@ -7,6 +7,7 @@ A voice assistant powered by OpenAI's Realtime API for direct audio-to-audio con
 - **Direct voice-to-voice** via OpenAI Realtime API over WebSocket
 - **Offline wake word** ("Hi Taco" default) via sherpa-onnx, with no account or access key
 - **YouTube Music** playback with voice commands and smart local caching
+- **Named countdown timers** with local chimes and saved timer state
 - **Album art** displayed in terminal during playback (ANSI true-color)
 - **Async audio I/O** with bounded conversation timeouts and orderly shutdown
 
@@ -80,6 +81,25 @@ After that download, wake-word detection runs locally without network access or 
 Say **"Hi Taco"** while music is playing, wait for the greeting, then say **"pause the music"**. Music pauses immediately on wake-up. It resumes after ordinary conversations, but an explicit pause keeps it paused until you request resume. Songs and album art are cached locally in `music_cache/`.
 
 Playback defaults to 35% volume so the microphone can hear the wake phrase over the speakers. Set `music_volume` in `config/config.json` between `0.0` and `1.0` to adjust it. Loud music can still mask speech; this application does not perform acoustic echo cancellation.
+
+### Timer Commands
+
+Say **"Hi Taco"**, wait for the greeting, then:
+
+| Command | Examples |
+|---------|----------|
+| Create | "Set an eight-minute pasta timer", "Start a tea timer for three minutes" |
+| Check | "How much time is left on my pasta timer?", "What timers are running?" |
+| Cancel | "Cancel the pasta timer" |
+| Dismiss an expired timer | "Dismiss the tea timer" |
+
+Timers continue across conversations and while music plays. When a timer expires, the terminal prints its label and a local chime sounds for up to ten seconds, temporarily lowering music volume. Saying **"Hi Taco"** hushes the chime before the greeting; the expired timer remains available to check or dismiss. During a conversation, speech also hushes the chime. Chimes wait for an ongoing spoken turn to finish. Dismissing or cancelling a timer never resumes explicitly paused music or restarts a stopped track.
+
+Countdowns support one second through 24 hours, with up to 20 running or undismissed timers. Duplicate labels are allowed; the assistant asks which one to cancel. Timer state is saved atomically in the ignored `data/timers.json`. Restarting restores future timers, chimes once for timers overdue by up to five minutes, and marks older ones missed. Dismiss missed timers to remove them from status results.
+
+Keep the app running and the computer awake for on-time alerts. Timers use a monotonic clock while running; recovery after restart uses the saved wall-clock deadline. Sleep and manual clock changes can affect recovery. These are countdowns, not recurring alarms, and cannot wake a sleeping computer. The chime itself needs no internet; spoken commands still need OpenAI.
+
+Configure `timer_alert_volume` (0–1, default 0.25), `timer_alert_seconds` (1–30, default 10), and `timer_store_path` in `config/config.json`. Relative storage paths resolve from the repository root. Use one assistant process per timer file.
 
 ## Development Setup
 
@@ -165,6 +185,8 @@ src/
   wake_word_model.py           # Pinned model download and cache
   realtime_voice_client.py     # OpenAI Realtime API (WebSocket)
   music_commands.py            # Music command handler
+  timers.py                    # Persistent countdown service and voice tools
+  timer_alerts.py               # Local chimes, hushing and music ducking
   youtube_music_player.py      # YouTube Music search, caching and mixer controls
   album_art.py                 # Optional terminal thumbnail rendering
   audio_io.py                  # Cancellation-safe device I/O and stream cleanup

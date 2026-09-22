@@ -64,6 +64,31 @@ def test_user_paused_track_stays_paused_across_another_conversation(playing):
     assert playing.get_status()["is_playing"]
 
 
+def test_timer_ducking_preserves_explicit_pause_and_stop(playing):
+    async def run():
+        await playing.pause_for_conversation()
+        playing.set_alert_ducked(True)
+        await playing.pause()
+        playing.set_alert_ducked(False)
+        assert playing.is_paused
+        assert not await playing.resume_after_conversation()
+        player_module.pygame.mixer.music.unpause.assert_not_called()
+        playing.set_alert_ducked(True)
+        await playing.stop()
+        playing.set_alert_ducked(False)
+        assert not playing.get_status()["is_playing"]
+        player_module.pygame.mixer.music.play.assert_not_called()
+
+    asyncio.run(run())
+
+
+def test_music_started_during_timer_alert_stays_ducked(player):
+    cache_track(player)
+    player.set_alert_ducked(True)
+    assert asyncio.run(player.play_song("12345678901", "Test song", "Test"))
+    player_module.pygame.mixer.music.set_volume.assert_called_with(player.volume * 0.2)
+
+
 def cache_track(player, video="12345678901", title="Test song"):
     path = player_module.Path(
         player._get_cached_file_path(player._generate_song_id(video, title, "Test"))

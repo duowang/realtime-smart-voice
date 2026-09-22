@@ -16,6 +16,8 @@ from audio_io import audio_operation, close_stream
 from configuration import DEFAULT_CONFIG_FILE, PROJECT_ROOT, get_api_key, load_config
 from music_commands import MusicCommandHandler
 from realtime_voice_client import RealtimeVoiceClient
+from timer_alerts import TimerAlerts
+from timers import TimerService
 from wake_word_detector import WakeWordDetector
 
 
@@ -29,13 +31,35 @@ class RealtimeVoiceAssistant:
         self.music_handler = None
         self.wake_word_detector = None
         self.realtime_client = None
+        self.timer_service = None
+        self.timer_alerts = None
+        self._pending_timer_alerts = {}
+        self._playing_prompt = False
         self._setup_logging()
         try:
             self.music_handler = MusicCommandHandler(
                 self._log_event, self.config.get("music_volume")
             )
+            self.timer_alerts = TimerAlerts(
+                self.music_handler.music_player.set_alert_ducked,
+                volume=self.config.get("timer_alert_volume", 0.25),
+                duration=self.config.get("timer_alert_seconds", 10),
+            )
+            timer_path = Path(self.config.get("timer_store_path", "data/timers.json")).expanduser()
+            if not timer_path.is_absolute():
+                timer_path = PROJECT_ROOT / timer_path
+            self.timer_service = TimerService(
+                timer_path,
+                on_expire=self._queue_timer_alerts,
+                on_remove=self._remove_timer_alert,
+                tick=self._tick_timer_alerts,
+            )
             self.realtime_client = RealtimeVoiceClient(
-                self.config, self._log_event, self.music_handler
+                self.config,
+                self._log_event,
+                self.music_handler,
+                timer_service=self.timer_service,
+                on_user_activity=self._hush_timer_alerts,
             )
             self.wake_word_detector = WakeWordDetector(self.config, self._log_event)
         except BaseException:
@@ -47,6 +71,45 @@ class RealtimeVoiceAssistant:
                 self.music_handler.cleanup()
             self._close_logging()
             raise
+
+    def _queue_timer_alerts(self, timers: list[dict]) -> None:
+        for timer in timers:
+            self._pending_timer_alerts[timer["timer_id"]] = timer
+            self._log_event("TIMER_EXPIRED", timer["timer_id"])
+            print(f"Timer finished: {timer['label']}")
+
+    def _tick_timer_alerts(self) -> None:
+        self.timer_alerts.update()
+        client = self.realtime_client
+        # Don't compete with a speaking user, streamed response, or greeting.
+        if (
+            self._shutting_down
+            or self._playing_prompt
+            or (
+                client is not None
+                and client.is_connected
+                and (
+                    client._user_speaking
+                    or client._response_in_progress
+                    or client.is_assistant_speaking
+                    or not client._output_queue.empty()
+                )
+            )
+        ):
+            self.timer_alerts.hush()
+            return
+        if self._pending_timer_alerts:
+            pending = list(self._pending_timer_alerts.values())
+            self._pending_timer_alerts.clear()
+            self.timer_alerts.ring(pending)
+
+    def _hush_timer_alerts(self) -> None:
+        self._pending_timer_alerts.clear()
+        self.timer_alerts.hush()
+
+    def _remove_timer_alert(self, timer_id: str) -> None:
+        self._pending_timer_alerts.pop(timer_id, None)
+        self.timer_alerts.remove(timer_id)
 
     def _setup_logging(self) -> None:
         directory = PROJECT_ROOT / "logs"
@@ -77,7 +140,9 @@ class RealtimeVoiceAssistant:
 
     async def _play_audio_file(self, path: str | Path, description: str, log_prefix: str) -> None:
         audio = stream = None
+        self._playing_prompt = True
         try:
+            self.timer_alerts.hush()
             data, rate = sf.read(path, dtype="float32", always_2d=True)
             if not data.size:
                 raise ValueError("Audio prompt is empty")
@@ -98,6 +163,7 @@ class RealtimeVoiceAssistant:
         except Exception as error:
             self._log_event(f"{log_prefix}_ERROR", f"Cannot play {description}: {error}")
         finally:
+            self._playing_prompt = False
             close_stream(stream)
             if audio is not None:
                 audio.terminate()
@@ -114,6 +180,7 @@ class RealtimeVoiceAssistant:
             )
 
     async def handle_wake_word_detection(self) -> None:
+        self._hush_timer_alerts()  # Local, before greeting or cloud connection.
         try:
             # Cover greeting, connection setup, tool work, and the conversation.
             async with asyncio.timeout(self.config.get("conversation_timeout", 120)):
@@ -149,6 +216,7 @@ class RealtimeVoiceAssistant:
         for sig in previous:
             loop.add_signal_handler(sig, request_shutdown)
         try:
+            self.timer_service.start()
             while self.running:
                 keyword = await self.wake_word_detector.listen_for_wake_word()
                 if keyword:
@@ -172,8 +240,16 @@ class RealtimeVoiceAssistant:
         self._cleaned_up = True
         self._shutting_down = True
         try:
-            if self.realtime_client is not None:
-                await self.realtime_client.cleanup()
+            try:
+                if self.timer_service is not None:
+                    await self.timer_service.close()
+            finally:
+                try:
+                    if self.timer_alerts is not None:
+                        self._hush_timer_alerts()
+                finally:
+                    if self.realtime_client is not None:
+                        await self.realtime_client.cleanup()
         finally:
             try:
                 if self.wake_word_detector is not None:

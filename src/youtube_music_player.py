@@ -40,6 +40,7 @@ class YouTubeMusicPlayer:
         self.is_playing = False
         self.is_paused = False
         self.was_paused_for_conversation = False
+        self._alert_ducked = False
         self._generation = 0
         self._closed = False
         self.cache_dir = str(PROJECT_ROOT / "music_cache")
@@ -248,7 +249,7 @@ class YouTubeMusicPlayer:
                 pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=1024)
             pygame.mixer.music.load(str(audio_file))
             # Loading a track resets pygame's volume.
-            pygame.mixer.music.set_volume(self.volume)
+            pygame.mixer.music.set_volume(self.volume * (0.2 if self._alert_ducked else 1))
             pygame.mixer.music.play()
             self.current_song = {
                 "videoId": video_id,
@@ -280,6 +281,14 @@ class YouTubeMusicPlayer:
         self.is_paused = True
         self.was_paused_for_conversation = False
         return True
+
+    def set_alert_ducked(self, ducked: bool) -> None:
+        """Timer sounds change gain only, never playback or auto-resume intent."""
+        if self._alert_ducked == ducked:
+            return
+        self._alert_ducked = ducked
+        if pygame.mixer.get_init():
+            pygame.mixer.music.set_volume(self.volume * (0.2 if ducked else 1))
 
     async def resume(self) -> bool:
         self._refresh_playback()

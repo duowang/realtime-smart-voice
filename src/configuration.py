@@ -37,6 +37,20 @@ def load_config(path: str | Path = DEFAULT_CONFIG_FILE) -> dict:
     for name in ("realtime_model", "realtime_voice", "transcription_model"):
         if name in config and (not isinstance(config[name], str) or not config[name].strip()):
             raise ValueError(f"{name} must be a non-empty string")
+    for name, default, lower, upper in (
+        ("timer_alert_volume", 0.25, 0, 1),
+        ("timer_alert_seconds", 10, 1, 30),
+    ):
+        value = config.setdefault(name, default)
+        if (
+            type(value) not in (int, float)
+            or not math.isfinite(value)
+            or not lower <= value <= upper
+        ):
+            raise ValueError(f"{name} must be between {lower} and {upper}")
+    path = config.setdefault("timer_store_path", "data/timers.json")
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("timer_store_path must be a non-empty path")
     return config
 
 

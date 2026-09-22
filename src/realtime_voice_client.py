@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from urllib.parse import quote
 
 import pyaudio
@@ -15,6 +16,7 @@ from websockets.exceptions import ConnectionClosedOK
 from audio_io import audio_operation, close_stream, complete_task
 from configuration import get_api_key
 from music_commands import MusicCommandHandler
+from timers import TIMER_NAMES, TIMER_TOOLS
 
 SAMPLE_RATE = 24000
 INPUT_FRAMES = 1024
@@ -38,9 +40,18 @@ class RealtimeVoiceClient:
         "cedar",
     }
 
-    def __init__(self, config: dict, log_function=None, music_handler=None):
+    def __init__(
+        self,
+        config: dict,
+        log_function=None,
+        music_handler=None,
+        timer_service=None,
+        on_user_activity=None,
+    ):
         self.config = config
         self.log_function = log_function
+        self.timer_service = timer_service
+        self.on_user_activity = on_user_activity
         self.api_key = get_api_key(config)
         self._owns_music = music_handler is None
         self.music_handler = (
@@ -86,6 +97,7 @@ class RealtimeVoiceClient:
             self.audio = pyaudio.PyAudio()
 
     def _reset_turn_state(self) -> None:
+        self._session_id = uuid.uuid4().hex
         self.last_user_activity_time = time.monotonic()
         self._assistant_finished_time = None
         self._assistant_text_buffer = ""
@@ -131,16 +143,29 @@ class RealtimeVoiceClient:
 
     def _build_session_instructions(self) -> str:
         """Build a concise instruction block tuned for voice and tool use."""
-        return (
+        instructions = (
             "You are a helpful voice assistant. "
             "You only speak English and Chinese (Mandarin). "
             "Reply in whichever of those languages the user is speaking. "
             "If audio is noisy or ambiguous, prefer English or Mandarin and ask for a brief repeat instead of guessing another language. "
             "You have music tools available and should use them whenever the user wants to play, pause, resume, stop, skip music, or check what's playing. "
             "Keep responses concise and complete. "
-            "Do not end responses with follow-up questions. "
+            "Ask a brief clarification only when needed to resolve ambiguous commands. "
             "The user will say the wake word again if they need more help."
         )
+        if self.timer_service is not None:
+            instructions += (
+                " You also have countdown timer tools. Always use create_timer to set a timer, "
+                "get_timers to check remaining time or expired timers, cancel_timer to cancel, "
+                "and dismiss_timer to acknowledge an expired timer. Never pretend to set a timer "
+                "without a successful tool result. Convert explicit durations to whole seconds; "
+                "ask if units are missing. These are countdowns, not calendar alarms or reminders. "
+                "Timers continue after this conversation but only sound while the app is running "
+                "and the computer is awake. Use returned IDs/labels; clarify ambiguous matches. "
+                "A bare stop while a timer is expired usually means dismiss the timer; if music "
+                "and timers are both plausible, ask which. Timer commands must not stop music."
+            )
+        return instructions
 
     def _build_session_config(self) -> dict:
         """Build the GA Realtime session configuration."""
@@ -200,7 +225,8 @@ class RealtimeVoiceClient:
                         "description": "Stop the current song. There is no queue; ask the user to choose another song.",
                         "parameters": {"type": "object", "properties": {}},
                     },
-                ],
+                ]
+                + (TIMER_TOOLS if self.timer_service is not None else []),
                 "audio": {
                     "input": {
                         "format": {"type": "audio/pcm", "rate": 24000},
@@ -321,6 +347,8 @@ class RealtimeVoiceClient:
                 if self._should_end_conversation(transcript):
                     self._request_end()
         elif kind == "input_audio_buffer.speech_started":
+            if self.on_user_activity is not None:
+                self.on_user_activity()
             self._user_speaking = True
             self.last_user_activity_time = time.monotonic()
             await self._interrupt_output()
@@ -382,8 +410,13 @@ class RealtimeVoiceClient:
                 except (ValueError, TypeError):
                     arguments = None
                 self._log("FUNCTION_CALL", f"{name}({arguments})")
-                result = await self.music_handler.execute(name, arguments)
-                started_music = result.get("success") and result.get("action") == "play"
+                if name in TIMER_NAMES and self.timer_service is not None:
+                    result = await self.timer_service.execute(
+                        name, arguments, call_id=f"{self._session_id}:{call['call_id']}"
+                    )
+                else:
+                    result = await self.music_handler.execute(name, arguments)
+                    started_music = result.get("success") and result.get("action") == "play"
                 # Apply the last control's result if a response contains several calls.
                 await self._send(
                     {
@@ -555,6 +588,12 @@ class RealtimeVoiceClient:
         # Wake-up has already auto-paused a loaded track. Let the model route a
         # bare "stop" to stop_music instead of closing and auto-resuming it.
         if cleaned == "stop" and self.music_handler.get_status().get("is_playing"):
+            return False
+        if (
+            cleaned == "stop"
+            and self.timer_service is not None
+            and self.timer_service.has_pending()
+        ):
             return False
 
         self._log("CONVERSATION_END_DETECTED", f"Standalone end phrase detected: '{text}'")

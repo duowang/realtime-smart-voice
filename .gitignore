@@ -72,6 +72,9 @@ models/
 # Music cache (downloaded songs)
 music_cache/
 
+# Local timer state
+data/
+
 # Temporary files
 tmp/
 temp/

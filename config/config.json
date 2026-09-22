@@ -9,6 +9,9 @@
   ],
   "wake_word_threshold": 0.1,
   "music_volume": 0.35,
+  "timer_alert_volume": 0.25,
+  "timer_alert_seconds": 10,
+  "timer_store_path": "data/timers.json",
   "conversation_timeout": 120,
   "silence_timeout": 8,
   "post_response_timeout": 6

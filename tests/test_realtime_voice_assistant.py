@@ -16,6 +16,10 @@ def assistant():
     result.config = {"conversation_timeout": 1}
     result._shutting_down = False
     result._cleaned_up = False
+    result.timer_service = Mock(close=AsyncMock())
+    result.timer_alerts = Mock()
+    result._pending_timer_alerts = {}
+    result._playing_prompt = False
     result.music_handler = Mock(pause_for_conversation=AsyncMock())
     result.play_wake_word_acknowledgment = AsyncMock()
     result.realtime_client = Mock(
@@ -35,11 +39,12 @@ def test_default_config_path_is_independent_of_working_directory(tmp_path, monke
 
 def test_music_pauses_before_wake_greeting_and_conversation(assistant):
     events = []
+    assistant.timer_alerts.hush.side_effect = lambda: events.append("hush")
     assistant.music_handler.pause_for_conversation.side_effect = lambda: events.append("pause")
     assistant.play_wake_word_acknowledgment.side_effect = lambda: events.append("greeting")
     assistant.realtime_client.start_conversation.side_effect = lambda: events.append("conversation")
     asyncio.run(assistant.handle_wake_word_detection())
-    assert events == ["pause", "greeting", "conversation"]
+    assert events == ["hush", "pause", "greeting", "conversation"]
 
 
 def test_failed_conversation_restores_music(assistant):
@@ -83,7 +88,46 @@ def test_cleanup_continues_after_component_failure(assistant):
     assistant.wake_word_detector.cleanup.assert_called_once()
     assistant.music_handler.cleanup.assert_called_once()
     assistant._close_logging.assert_called_once()
+    assistant.timer_service.close.assert_awaited_once()
+    assistant.timer_alerts.hush.assert_called_once()
     asyncio.run(assistant.cleanup())
+    assistant.music_handler.cleanup.assert_called_once()
+
+
+def test_timer_alert_waits_for_speech_and_cancel_removes_pending_alert(assistant):
+    client = assistant.realtime_client
+    client.is_connected = True
+    client._user_speaking = True
+    client._response_in_progress = False
+    client.is_assistant_speaking = False
+    client._output_queue = asyncio.Queue()
+    assistant._queue_timer_alerts([{"timer_id": "a", "label": "tea"}])
+    assistant._tick_timer_alerts()
+    assistant.timer_alerts.ring.assert_not_called()
+    client._user_speaking = False
+    assistant._tick_timer_alerts()
+    assistant.timer_alerts.ring.assert_called_once_with([{"timer_id": "a", "label": "tea"}])
+    assistant._queue_timer_alerts([{"timer_id": "b", "label": "pasta"}])
+    assistant._remove_timer_alert("b")
+    assert not assistant._pending_timer_alerts
+
+
+def test_closed_conversation_cannot_suppress_new_timer_alerts(assistant):
+    # A timeout can close the socket before response.done clears these flags.
+    assistant.realtime_client.is_connected = False
+    assistant.realtime_client._response_in_progress = True
+    assistant.realtime_client._user_speaking = True
+    assistant._queue_timer_alerts([{"timer_id": "a", "label": "tea"}])
+    assistant._tick_timer_alerts()
+    assistant.timer_alerts.ring.assert_called_once()
+
+
+def test_timer_cleanup_failure_still_releases_voice_and_music(assistant):
+    assistant.timer_service.close.side_effect = OSError("timer failure")
+    with pytest.raises(OSError, match="timer failure"):
+        asyncio.run(assistant.cleanup())
+    assistant.timer_alerts.hush.assert_called_once()
+    assistant.realtime_client.cleanup.assert_awaited_once()
     assistant.music_handler.cleanup.assert_called_once()
 
 

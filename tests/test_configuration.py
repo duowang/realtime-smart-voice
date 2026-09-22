@@ -15,6 +15,12 @@ from configuration import get_api_key, load_config
         {"conversation_timeout": True},
         {"post_response_timeout": float("nan")},
         {"realtime_model": None},
+        {"timer_alert_volume": True},
+        {"timer_alert_volume": 1.1},
+        {"timer_alert_seconds": 0},
+        {"timer_alert_seconds": 31},
+        {"timer_alert_seconds": float("inf")},
+        {"timer_store_path": ""},
     ],
 )
 def test_invalid_config_fails_before_runtime(tmp_path, value):

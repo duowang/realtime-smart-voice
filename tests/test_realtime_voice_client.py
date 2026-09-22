@@ -9,6 +9,7 @@ import pytest
 
 import realtime_voice_client as module
 from realtime_voice_client import RealtimeVoiceClient
+from timers import TimerService
 
 
 @pytest.fixture
@@ -134,6 +135,57 @@ def test_invalid_function_json_cannot_silently_execute_stop(client):
     client.music_handler.execute = AsyncMock(return_value={"success": False})
     asyncio.run(client._handle_event(tool_response("stop_music", "{")))
     client.music_handler.execute.assert_awaited_once_with("stop_music", None)
+
+
+def test_timer_tools_route_to_shared_service_and_outlive_conversation(client, tmp_path):
+    expired = Mock()
+    now = [0.0]
+    client.timer_service = TimerService(
+        tmp_path / "timers.json", on_expire=expired, clock=lambda: now[0], wall_clock=lambda: now[0]
+    )
+    client.websocket = Mock(send=AsyncMock(), close=AsyncMock())
+    client.music_handler.execute = AsyncMock()
+
+    async def run():
+        assert "create_timer" in {
+            t["name"] for t in client._build_session_config()["session"]["tools"]
+        }
+        await client._handle_event(
+            tool_response("create_timer", '{"duration_seconds":60,"label":"tea"}')
+        )
+        assert not client.conversation_should_end
+        client.music_handler.execute.assert_not_awaited()
+        outputs = [json.loads(c.args[0]) for c in client.websocket.send.call_args_list]
+        assert json.loads(outputs[0]["item"]["output"])["timer"]["label"] == "tea"
+        assert outputs[-1]["type"] == "response.create"
+        # Replaying a completed call cannot create another timer.
+        await client._handle_event(
+            tool_response("create_timer", '{"duration_seconds":60,"label":"tea"}')
+        )
+        assert len((await client.timer_service.execute("get_timers", {}))["timers"]) == 1
+        await client.stop_conversation()
+        now[0] = 60
+        await client.timer_service.poll()
+        expired.assert_called_once()
+        await client.timer_service.close()
+
+    asyncio.run(run())
+
+
+def test_stop_with_timer_reaches_model_and_speech_hushes_alert(client, tmp_path):
+    client.music_handler.get_status.return_value = {"is_playing": False}
+    client.timer_service = TimerService(tmp_path / "timers.json")
+    client.on_user_activity = Mock()
+
+    async def run():
+        await client.timer_service.execute("create_timer", {"duration_seconds": 60})
+        assert not client._should_end_conversation("Stop.")
+        assert not client._should_end_conversation("Cancel my timer.")
+        await client._handle_event({"type": "input_audio_buffer.speech_started"})
+        client.on_user_activity.assert_called_once()
+        await client.timer_service.close()
+
+    asyncio.run(run())
 
 
 def test_microphone_failure_cancels_siblings_and_closes_resources(client, monkeypatch):
