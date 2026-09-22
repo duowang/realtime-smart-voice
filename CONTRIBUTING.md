@@ -31,7 +31,8 @@ Thank you for your interest in contributing! This project welcomes contributions
 
 3. **Install dependencies:**
    ```bash
-   ./run.sh  # This will create venv and install dependencies
+   ./run.sh --setup-only  # Requires Python 3.12; creates venv and installs dependencies
+   make dev-deps
    ```
 
 4. **Test the setup:**
@@ -48,6 +49,7 @@ Thank you for your interest in contributing! This project welcomes contributions
 - Keep functions focused and modular
 
 ### Testing
+- Run `make check` for compilation, Ruff linting, and the pytest suite
 - Test your changes thoroughly on your local setup
 - Ensure wake word detection still works
 - Verify real-time conversation functionality
@@ -112,7 +114,7 @@ Update documentation for new configuration options
 ## API Considerations
 
 ### OpenAI Realtime API
-- This is currently in beta - changes may be needed
+- Keep session configuration and event handling compatible with the Realtime API used by the client
 - Respect rate limits and usage guidelines
 - Handle connection failures gracefully
 

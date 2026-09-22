@@ -1,28 +1,29 @@
 #!/usr/bin/env python3
 
-import os
-import sys
-import json
 import asyncio
+import json
 import logging
+import os
 import signal
-import time
-from datetime import datetime
-from typing import Optional
-from dotenv import load_dotenv
+import sys
+
+import numpy as np
 import pyaudio
 import soundfile as sf
-import numpy as np
+from dotenv import load_dotenv
 
-from wake_word_detector import WakeWordDetector
-from realtime_voice_client import RealtimeVoiceClient
 from music_commands import MusicCommandHandler
+from realtime_voice_client import RealtimeVoiceClient
+from wake_word_detector import WakeWordDetector
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_CONFIG_FILE = os.path.join(PROJECT_ROOT, "config", "config.json")
 
 
 class RealtimeVoiceAssistant:
     """Main realtime voice assistant using wake word detection + OpenAI Realtime API"""
     
-    def __init__(self, config_file: str = "../config/config.json"):
+    def __init__(self, config_file: str = DEFAULT_CONFIG_FILE):
         """Initialize the realtime voice assistant"""
         # Load environment variables from .env file
         self._load_env_vars()
@@ -60,7 +61,7 @@ class RealtimeVoiceAssistant:
     def _load_config(self, config_file: str) -> dict:
         """Load configuration from JSON file"""
         try:
-            with open(config_file, 'r') as f:
+            with open(config_file) as f:
                 return json.load(f)
         except FileNotFoundError:
             print(f"Config file not found: {config_file}")
@@ -215,12 +216,37 @@ class RealtimeVoiceAssistant:
         print("Press Ctrl+C to exit.\n")
         
         self.running = True
+        loop = asyncio.get_running_loop()
+        shutdown_requested = False
         
         # Setup signal handlers
+        async def request_shutdown():
+            """Stop active components promptly after a shutdown signal."""
+            try:
+                if hasattr(self, 'realtime_client'):
+                    self.realtime_client.conversation_should_end = True
+                    if self.realtime_client.is_connected:
+                        await self.realtime_client.stop_conversation()
+            except Exception as e:
+                self._log_event("SYSTEM_ERROR", f"Error stopping realtime client on shutdown: {e}")
+
+            try:
+                if hasattr(self, 'wake_word_detector') and self.wake_word_detector.is_listening:
+                    await self.wake_word_detector.stop_listening()
+            except Exception as e:
+                self._log_event("SYSTEM_ERROR", f"Error stopping wake word detector on shutdown: {e}")
+
         def signal_handler(signum, frame):
+            nonlocal shutdown_requested
+            if shutdown_requested:
+                return
+            shutdown_requested = True
             print("\nShutdown signal received...")
             self.running = False
+            loop.call_soon_threadsafe(lambda: asyncio.create_task(request_shutdown()))
         
+        previous_sigint = signal.getsignal(signal.SIGINT)
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
         
@@ -260,6 +286,8 @@ class RealtimeVoiceAssistant:
             print(f"Error in continuous mode: {e}")
             self._log_event("SYSTEM_ERROR", f"Continuous mode error: {e}")
         finally:
+            signal.signal(signal.SIGINT, previous_sigint)
+            signal.signal(signal.SIGTERM, previous_sigterm)
             await self.cleanup()
     
     async def _wait_for_conversation_end(self):
@@ -296,7 +324,7 @@ async def main():
     import argparse
     
     parser = argparse.ArgumentParser(description="Realtime Smart Voice Assistant")
-    parser.add_argument("--config", default="../config/config.json",
+    parser.add_argument("--config", default=DEFAULT_CONFIG_FILE,
                        help="Configuration file path")
     
     args = parser.parse_args()

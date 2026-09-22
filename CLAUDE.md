@@ -27,7 +27,7 @@ This project provides a modern real-time voice assistant with:
 sudo apt install -y portaudio19-dev python3-pyaudio python3-pip python3-venv
 
 # Create and activate virtual environment
-python3 -m venv venv
+python3.12 -m venv venv
 source venv/bin/activate
 
 # Install Python dependencies
@@ -72,7 +72,7 @@ arecord -d 5 test.wav && aplay test.wav
    - Asynchronous Picovoice Porcupine integration
    - Custom "Hi Taco" wake word with .ppn file
    - PyAudio-based continuous audio monitoring
-   - High sensitivity (0.9) for responsive detection
+   - Moderate sensitivity (0.6) to reduce false activations
 
 3. **RealtimeVoiceClient** (`realtime_voice_client.py`) - Real-time conversation
    - Direct WebSocket connection to OpenAI Realtime API (GA)
@@ -112,24 +112,23 @@ Main config: `config/config.json`
 Environment Variables (.env file):
 - `OPENAI_API_KEY` - Required for Realtime API access
 - `PORCUPINE_ACCESS_KEY` - Required for wake word detection
-- `CONVERSATION_TIMEOUT` - Optional conversation timeout (default: 30)
-- `LOG_LEVEL` - Optional logging level (default: INFO)
+Runtime timeouts are configured in `config/config.json`: `conversation_timeout` (120 seconds), `silence_timeout` (8 seconds), and `post_response_timeout` (6 seconds). Logging uses INFO level.
 
 The project supports `.env` files for secure API key management with automatic loading via python-dotenv.
 
 ### Custom Wake Word
 
 Uses a custom "Hi Taco" wake word:
-- File: `Hi-Taco_en_raspberry-pi_v3_0_0.ppn` and `Hi-Taco_en_mac_v3_0_0.ppn`
-- High sensitivity (0.9) for fastest detection
+- File: `Hi-Taco_en_<platform>_v4_0_0.ppn`, generated on first launch if missing
+- Moderate sensitivity (0.6) to reduce false activations
 - Asynchronous processing to avoid blocking
 
 ### OpenAI Realtime API Integration
 
 This project uses OpenAI's Realtime API (GA, not beta):
 - **Endpoint**: `wss://api.openai.com/v1/realtime`
-- **Model**: `gpt-realtime` (configurable via `realtime_model` in config)
-- **Voice**: `alloy` (configurable)
+- **Model**: `gpt-realtime-2.1` (configurable via `realtime_model` in config)
+- **Voice**: `marin` (configurable)
 - **Connection**: Direct WebSocket via `websockets` library (no Pipecat)
 - **Audio Format**: PCM 24kHz, mono, 16-bit
 - **VAD**: Server-side voice activity detection (`server_vad`)
@@ -183,7 +182,7 @@ When working with real-time audio:
 ### API Requirements
 OpenAI Realtime API considerations:
 - **GA Access**: Uses the generally available Realtime API (not beta)
-- **Model**: `gpt-realtime` (configurable)
+- **Model**: `gpt-realtime-2.1` (configurable)
 - **Rate Limits**: Monitor API usage and implement backoff if needed
 - **Connection Management**: Handle WebSocket connections properly
 
@@ -205,7 +204,7 @@ Maintain async/await throughout:
 ### Python Packages
 - `openai>=1.3.0`: OpenAI API client
 - `websockets>=12.0`: WebSocket connection to Realtime API
-- `pvporcupine>=3.0.0`: Picovoice wake word detection
+- `pvporcupine>=4.0.0,<5.0.0`: Picovoice wake word detection
 - `pyaudio>=0.2.11`: Audio input/output
 - `numpy>=1.24.0`: Audio processing
 - `soundfile>=0.12.1`: Audio file reading
@@ -217,7 +216,7 @@ Maintain async/await throughout:
 - `Pillow>=10.0.0`: Thumbnail image processing and terminal rendering
 
 ### System Requirements
-- Python 3.8+
+- Python 3.12
 - PortAudio development libraries
 - Working microphone and audio output
 - Internet connection for API access

@@ -58,6 +58,12 @@ logs/*.log
 *.mp3
 *.flac
 test_audio.*
+!audio/hi_there.wav
+!audio/bye_bye.wav
+
+# Locally generated Porcupine 4 wake-word models
+Hi-Taco_en_*_v4_0_0.ppn
+.Hi-Taco_en_*.tmp.ppn
 
 # Music cache (downloaded songs)
 music_cache/
@@ -66,3 +72,8 @@ music_cache/
 tmp/
 temp/
 .tmp/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/

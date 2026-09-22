@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
-import asyncio
-from typing import Optional, Dict, Callable
+from typing import Callable, Optional
+
 from youtube_music_player import YouTubeMusicPlayer
 
 
@@ -22,7 +22,7 @@ class MusicCommandHandler:
         else:
             print(f"[{log_type}] {message}")
     
-    async def execute(self, function_name: str, arguments: dict) -> Dict:
+    async def execute(self, function_name: str, arguments: dict) -> dict:
         """
         Execute a music function by name.
 
@@ -63,7 +63,7 @@ class MusicCommandHandler:
                 "action": "error",
             }
     
-    async def _handle_play_command(self, query: str) -> Dict:
+    async def _handle_play_command(self, query: str) -> dict:
         """Handle play music command"""
         try:
             self._log("MUSIC_PLAY_CMD", f"Playing: {query}")
@@ -95,7 +95,7 @@ class MusicCommandHandler:
                 'query': query
             }
     
-    async def _handle_pause_command(self) -> Dict:
+    async def _handle_pause_command(self) -> dict:
         """Handle pause music command"""
         try:
             status = self.music_player.get_status()
@@ -138,7 +138,7 @@ class MusicCommandHandler:
                 'action': 'pause_error'
             }
     
-    async def _handle_resume_command(self) -> Dict:
+    async def _handle_resume_command(self) -> dict:
         """Handle resume music command"""
         try:
             status = self.music_player.get_status()
@@ -181,7 +181,7 @@ class MusicCommandHandler:
                 'action': 'resume_error'
             }
     
-    async def _handle_stop_command(self) -> Dict:
+    async def _handle_stop_command(self) -> dict:
         """Handle stop music command"""
         try:
             status = self.music_player.get_status()
@@ -217,7 +217,7 @@ class MusicCommandHandler:
                 'action': 'stop_error'
             }
     
-    async def _handle_status_command(self) -> Dict:
+    async def _handle_status_command(self) -> dict:
         """Handle music status command"""
         try:
             status = self.music_player.get_status()
@@ -264,7 +264,7 @@ class MusicCommandHandler:
                 'action': 'status_error'
             }
     
-    async def _handle_next_command(self) -> Dict:
+    async def _handle_next_command(self) -> dict:
         """Handle next/skip command"""
         try:
             # For now, just stop current song (next song functionality would need playlist support)
@@ -310,7 +310,7 @@ class MusicCommandHandler:
             self._log("MUSIC_ERROR", f"Error resuming after conversation: {e}")
             return False
     
-    def get_status(self) -> Dict:
+    def get_status(self) -> dict:
         """Get current music status"""
         return self.music_player.get_status()
     

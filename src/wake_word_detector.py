@@ -1,11 +1,71 @@
 import os
-import struct
 import platform
+from pathlib import Path
+from typing import Callable, Optional
+
+import numpy as np
 import pvporcupine
 import pyaudio
-import asyncio
-from typing import Optional, List, Callable
-import numpy as np
+
+PORCUPINE_MODEL_VERSION = "4_0_0"
+WAKE_WORD = "Hi Taco"
+
+
+def _platform_suffix() -> str:
+    """Return the Picovoice filename suffix for the current platform."""
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    is_arm = "arm" in machine or "aarch64" in machine
+
+    if system == "darwin":
+        return "mac_apple" if is_arm else "mac"
+    if system == "linux":
+        return "raspberry-pi" if is_arm else "linux-x86_64"
+    if system == "windows":
+        return "windows-amd64"
+
+    raise RuntimeError(f"Unsupported wake-word platform: {system} ({machine})")
+
+
+def _compatible_keyword_path(access_key: str) -> Path:
+    """Return a Porcupine 4 keyword file, training it on first use if needed."""
+    project_root = Path(__file__).resolve().parent.parent
+    platform_suffix = _platform_suffix()
+    keyword_path = project_root / (
+        f"Hi-Taco_en_{platform_suffix}_v{PORCUPINE_MODEL_VERSION}.ppn"
+    )
+
+    if keyword_path.exists():
+        return keyword_path
+
+    temporary_path = keyword_path.with_name(
+        f".{keyword_path.stem}.tmp{keyword_path.suffix}"
+    )
+    print(
+        f"No Porcupine 4 Hi Taco model found for {platform_suffix}; "
+        "generating one now..."
+    )
+
+    try:
+        temporary_path.unlink(missing_ok=True)
+        pvporcupine.train_wake_word_from_phrase(
+            access_key=access_key,
+            output_path=str(temporary_path),
+            language="en",
+            phrase=WAKE_WORD,
+        )
+        temporary_path.replace(keyword_path)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            "Could not generate a Porcupine 4 Hi Taco model. Update "
+            "PORCUPINE_ACCESS_KEY with an active key from "
+            "https://console.picovoice.ai/ and rerun ./run.sh, or download a "
+            f"Porcupine 4 model to {keyword_path}."
+        ) from None
+
+    print(f"Generated Porcupine 4 keyword file: {keyword_path.name}")
+    return keyword_path
 
 
 class WakeWordDetector:
@@ -47,54 +107,11 @@ class WakeWordDetector:
             raise RuntimeError("Porcupine access key is required. Cannot start wake word detector.")
         
         try:
-            # Determine platform-specific .ppn file
-            system = platform.system().lower()
-            machine = platform.machine().lower()
-            
-            # Map platform to expected .ppn file suffix
-            platform_suffix = ""
-            if system == "darwin":  # macOS
-                if "arm" in machine or "aarch64" in machine:
-                    platform_suffix = "mac_apple"
-                else:
-                    platform_suffix = "mac"
-            elif system == "linux":
-                if "arm" in machine or "aarch64" in machine:
-                    platform_suffix = "raspberry-pi"
-                else:
-                    platform_suffix = "linux-x86_64"
-            elif system == "windows":
-                platform_suffix = "windows-amd64"
-            else:
-                # Fallback to raspberry-pi format (original)
-                platform_suffix = "raspberry-pi"
-            
-            # Try platform-specific file first, then fallback to raspberry-pi
-            ppn_filenames = [
-                f"Hi-Taco_en_{platform_suffix}_v3_0_0.ppn",
-                "Hi-Taco_en_raspberry-pi_v3_0_0.ppn"  # fallback
-            ]
-            
-            custom_ppn_path = None
-            for filename in ppn_filenames:
-                potential_path = os.path.join(os.path.dirname(__file__), f"../{filename}")
-                if os.path.exists(potential_path):
-                    custom_ppn_path = potential_path
-                    print(f"✓ Using Hi Taco keyword file: {filename}")
-                    break
-            
-            if not custom_ppn_path:
-                available_files = [f for f in os.listdir(os.path.dirname(__file__) + "/../") if f.startswith("Hi-Taco") and f.endswith(".ppn")]
-                error_msg = (
-                    f"Hi Taco .ppn file not found for platform: {system} ({machine})\n"
-                    f"Tried: {ppn_filenames}\n"
-                    f"Available .ppn files: {available_files}\n"
-                    f"Please download the correct .ppn file for {platform_suffix} platform."
-                )
-                raise RuntimeError(error_msg)
-            
-            keyword_paths = [custom_ppn_path]
-            self.wake_keywords = ["Hi Taco"]
+            custom_ppn_path = _compatible_keyword_path(access_key)
+            print(f"✓ Using Hi Taco keyword file: {custom_ppn_path.name}")
+
+            keyword_paths = [str(custom_ppn_path)]
+            self.wake_keywords = [WAKE_WORD]
             
             # Initialize Porcupine with moderate sensitivity to reduce false positives during music playback
             # Sensitivity: 0.0 (least sensitive) to 1.0 (most sensitive). 0.6 balances accuracy vs false positives
@@ -109,7 +126,7 @@ class WakeWordDetector:
             
         except Exception as e:
             print(f"Error initializing Porcupine: {e}")
-            raise RuntimeError(f"Porcupine initialization failed: {e}")
+            raise RuntimeError(f"Porcupine initialization failed: {e}") from e
     
     def _init_audio(self):
         """Initialize PyAudio for microphone input"""

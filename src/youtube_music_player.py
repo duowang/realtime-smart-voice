@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 
 import asyncio
-import threading
-import time
-import os
-import re
-import sys
 import base64
 import hashlib
 import json
+import os
+import re
 import subprocess
-import requests
+import sys
+import threading
+import time
 from datetime import datetime
-from typing import Optional, List, Dict, Callable
+from typing import Callable, Optional
+
 import pygame
-from ytmusicapi import YTMusic
-from PIL import Image
+import requests
 import yt_dlp
+from PIL import Image
+from ytmusicapi import YTMusic
 
 
 class YouTubeMusicPlayer:
@@ -88,17 +89,17 @@ class YouTubeMusicPlayer:
         """Get the file path for a cached thumbnail"""
         return os.path.join(self.cache_dir, f"{song_id}_thumb.jpg")
     
-    def _load_metadata(self) -> Dict:
+    def _load_metadata(self) -> dict:
         """Load metadata from cache"""
         try:
             if os.path.exists(self.metadata_file):
-                with open(self.metadata_file, 'r', encoding='utf-8') as f:
+                with open(self.metadata_file, encoding='utf-8') as f:
                     return json.load(f)
         except Exception as e:
             self._log("CACHE_ERROR", f"Error loading metadata: {e}")
         return {}
     
-    def _save_metadata(self, metadata: Dict):
+    def _save_metadata(self, metadata: dict):
         """Save metadata to cache"""
         try:
             with open(self.metadata_file, 'w', encoding='utf-8') as f:
@@ -135,7 +136,7 @@ class YouTubeMusicPlayer:
         metadata[song_id] = entry
         self._save_metadata(metadata)
     
-    async def search_songs(self, query: str, limit: int = 5) -> List[Dict]:
+    async def search_songs(self, query: str, limit: int = 5) -> list[dict]:
         """
         Search for songs on YouTube Music
 
@@ -568,7 +569,7 @@ class YouTubeMusicPlayer:
             return True
         return False
     
-    def get_cache_info(self) -> Dict:
+    def get_cache_info(self) -> dict:
         """Get information about cached songs"""
         try:
             metadata = self._load_metadata()
@@ -593,7 +594,7 @@ class YouTubeMusicPlayer:
             self._log("CACHE_ERROR", f"Error getting cache info: {e}")
             return {'error': str(e)}
     
-    def get_status(self) -> Dict:
+    def get_status(self) -> dict:
         """Get current playback status"""
         return {
             'is_playing': self.is_playing,

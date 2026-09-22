@@ -1,7 +1,10 @@
 {
   "openai_api_key": null,
   "chatgpt_model": "gpt-4o",
-  "realtime_model": "gpt-realtime",
+  "realtime_model": "gpt-realtime-2.1",
+  "realtime_voice": "marin",
+  "transcription_model": "gpt-4o-mini-transcribe",
+  "transcription_language": null,
   "language": "en",
   "tts_engine": "openai",
   "tts_model": "tts-1",
