@@ -43,9 +43,14 @@ class TimerAlerts:
         if not self._timer_ids:
             self.hush()
 
-    def update(self) -> None:
+    @property
+    def is_ringing(self) -> bool:
+        return self._channel is not None
+
+    def update(self) -> bool:
         if self._channel is not None and not self._channel.get_busy():
             self.hush()
+        return self.is_ringing
 
     def hush(self) -> None:
         """Never pause/resume music: restoring volume preserves explicit user intent."""

@@ -171,6 +171,108 @@ def test_cancelled_download_never_starts_playback(player):
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("close", [False, True])
+def test_artwork_does_not_delay_music_and_cannot_render_after_stop(player, close):
+    async def run():
+        entered = asyncio.Event()
+
+        async def delayed(*_):
+            entered.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                # Even a late result from a cancelled operation must be discarded.
+                return "late.jpg"
+
+        cache_track(player)
+        player.album_art.is_visible = lambda: True
+        player.album_art.download = delayed
+        player.album_art.render = Mock()
+        async with asyncio.timeout(1):
+            assert await player.play_song("12345678901", "Test song", "Test", "mock://art")
+            player_module.pygame.mixer.music.play.assert_called_once()
+            await entered.wait()
+            task = player._art_task
+            if close:
+                await handler_for(player).aclose()
+            else:
+                await player.stop()
+        assert task.done()
+        player.album_art.render.assert_not_called()
+        assert not player.get_status()["is_playing"]
+        assert not [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+
+    asyncio.run(run())
+
+
+def test_artwork_failure_does_not_stop_successful_playback(player):
+    async def run():
+        cache_track(player)
+        player.album_art.is_visible = lambda: True
+        player.album_art.download = AsyncMock(side_effect=OSError("image unavailable"))
+        assert await player.play_song("12345678901", "Test song", "Test", "mock://art")
+        await player._art_task
+        assert player.get_status()["is_playing"]
+        await player.stop()
+
+    asyncio.run(run())
+
+
+def test_new_track_replaces_old_artwork(player):
+    async def run():
+        cache_track(player)
+        cache_track(player, title="Second song")
+        player.album_art.is_visible = lambda: True
+        player.album_art.download = AsyncMock(return_value="current.jpg")
+        player.album_art.render = Mock()
+        assert await player.play_song("12345678901", "Test song", "Test", "mock://old")
+        old_task = player._art_task
+        assert await player.play_song("12345678901", "Second song", "Test", "mock://new")
+        await player._art_task
+        assert old_task.done()
+        player.album_art.render.assert_called_once_with("current.jpg", "Second song", "Test")
+        await player.stop()
+
+    asyncio.run(run())
+
+
+def test_music_close_releases_mixer_even_if_stop_fails(player):
+    player_module.pygame.mixer.music.stop.side_effect = OSError("device removed")
+    with pytest.raises(OSError, match="device removed"):
+        asyncio.run(handler_for(player).aclose())
+    player_module.pygame.mixer.quit.assert_called_once()
+
+
+def test_newer_play_wins_while_previous_artwork_is_being_cancelled(player):
+    async def run():
+        entered, cancelling, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def delayed(*_):
+            entered.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancelling.set()
+                await release.wait()
+
+        for title in ("First", "Second", "Third"):
+            cache_track(player, title=title)
+        player.album_art.is_visible = lambda: True
+        player.album_art.download = delayed
+        async with asyncio.timeout(1):
+            assert await player.play_song("12345678901", "First", "Test", "mock://art")
+            await entered.wait()
+            older = asyncio.create_task(player.play_song("12345678901", "Second", "Test"))
+            await cancelling.wait()
+            assert await player.play_song("12345678901", "Third", "Test")
+            release.set()
+            assert not await older
+        assert player.get_status()["current_song"]["title"] == "Third"
+        await player.stop()
+
+    asyncio.run(run())
+
+
 def test_stop_paused_music_prevents_later_auto_resume(playing):
     asyncio.run(playing.pause_for_conversation())
     assert asyncio.run(playing.stop())

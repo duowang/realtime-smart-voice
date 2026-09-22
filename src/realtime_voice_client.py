@@ -574,7 +574,7 @@ class RealtimeVoiceClient:
                     audio.terminate()
             finally:
                 if self._owns_music:
-                    self.music_handler.cleanup()
+                    await self.music_handler.aclose()
 
     def _should_end_conversation(self, text: str) -> bool:
         """End on standalone farewells, not words embedded in music commands."""

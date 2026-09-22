@@ -1,4 +1,4 @@
-.PHONY: setup run dev-deps lint test check
+.PHONY: setup run dev-deps lint test check benchmark
 
 setup:
 	./run.sh --setup-only
@@ -17,3 +17,6 @@ test:
 
 check:
 	. venv/bin/activate && python -m compileall -q src tests generate_audio.py && ruff check src tests generate_audio.py && pytest
+
+benchmark:
+	venv/bin/python tests/performance_sweep.py --output tmp/performance-sweep/current.json

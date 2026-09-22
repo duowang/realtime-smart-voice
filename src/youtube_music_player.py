@@ -42,6 +42,7 @@ class YouTubeMusicPlayer:
         self.was_paused_for_conversation = False
         self._alert_ducked = False
         self._generation = 0
+        self._art_task = None
         self._closed = False
         self.cache_dir = str(PROJECT_ROOT / "music_cache")
         self.metadata_file = os.path.join(self.cache_dir, "metadata.json")
@@ -226,8 +227,12 @@ class YouTubeMusicPlayer:
             or not re.fullmatch(r"[\w-]{11}", video_id, re.ASCII)
         ):
             return False
+        # stop can yield while joining old artwork. A newer request must win if
+        # it starts during that handoff, just as it does during audio downloads.
+        generation = self._generation + 1
         await self.stop()
-        generation = self._generation
+        if generation != self._generation or self._closed:
+            return False
         song_id = self._generate_song_id(video_id, title, artist)
         audio_file = Path(self._get_cached_file_path(song_id))
         try:
@@ -238,13 +243,6 @@ class YouTubeMusicPlayer:
                 return False
             if not thumbnail_url:
                 thumbnail_url = self._load_metadata().get(song_id, {}).get("thumbnail_url")
-            # Album art is optional and skipped for redirected/headless output.
-            if thumbnail_url and self.album_art.is_visible():
-                thumbnail = await self.album_art.download(thumbnail_url, song_id)
-                if generation != self._generation or self._closed:
-                    return False
-                if thumbnail:
-                    self.album_art.render(thumbnail, title, artist)
             if not pygame.mixer.get_init():
                 pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=1024)
             pygame.mixer.music.load(str(audio_file))
@@ -262,6 +260,11 @@ class YouTubeMusicPlayer:
             self.is_paused = False
             self._cache_song(song_id, video_id, title, artist, thumbnail_url)
             self._log("MUSIC_PLAYBACK", f"Playing: {title} by {artist}")
+            # Optional artwork must not delay playback or returning to wake detection.
+            if thumbnail_url and self.album_art.is_visible():
+                self._art_task = asyncio.create_task(
+                    self._show_album_art(thumbnail_url, song_id, title, artist, generation)
+                )
             return True
         except asyncio.CancelledError:
             if generation == self._generation:
@@ -272,6 +275,24 @@ class YouTubeMusicPlayer:
                 await self.stop()
             self._log("MUSIC_ERROR", f"Playback failed: {error}")
             return False
+
+    async def _show_album_art(
+        self, url: str, song_id: str, title: str, artist: str, generation: int
+    ) -> None:
+        try:
+            thumbnail = await self.album_art.download(url, song_id)
+            if thumbnail and generation == self._generation and not self._closed:
+                self._refresh_playback()
+                if self.is_playing:
+                    self.album_art.render(thumbnail, title, artist)
+        except Exception as error:
+            self._log("ART_ERROR", f"Cannot show album art: {error}")
+
+    def _cancel_album_art(self) -> asyncio.Task | None:
+        task, self._art_task = self._art_task, None
+        if task is not None:
+            task.cancel()
+        return task
 
     async def pause(self) -> bool:
         self._refresh_playback()
@@ -315,11 +336,16 @@ class YouTubeMusicPlayer:
     async def stop(self) -> bool:
         """Also invalidate pending searches/downloads before they can start a track."""
         self._generation += 1
+        art = self._cancel_album_art()
         had_track = self.is_playing
         self._clear_track()
-        if pygame.mixer.get_init():
-            pygame.mixer.music.stop()
-            pygame.mixer.music.unload()
+        try:
+            if pygame.mixer.get_init():
+                pygame.mixer.music.stop()
+                pygame.mixer.music.unload()
+        finally:
+            if art is not None:
+                await asyncio.gather(art, return_exceptions=True)
         return had_track
 
     def get_status(self) -> dict:
@@ -370,6 +396,7 @@ class YouTubeMusicPlayer:
             return
         self._closed = True
         self._generation += 1
+        self._cancel_album_art()
         self._clear_track()
         if pygame.mixer.get_init():
             pygame.mixer.quit()

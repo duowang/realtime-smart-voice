@@ -99,3 +99,10 @@ class MusicCommandHandler:
 
     def cleanup(self) -> None:
         self.music_player.cleanup()
+
+    async def aclose(self) -> None:
+        """Join optional artwork before releasing playback and its logging owner."""
+        try:
+            await self.music_player.stop()
+        finally:
+            self.cleanup()

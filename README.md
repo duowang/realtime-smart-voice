@@ -126,6 +126,11 @@ make dev-deps
 make check
 ```
 
+Run the local performance benchmarks with `make benchmark`. They measure timer
+scheduler overhead, greeting overhead, and cached music startup with slow artwork.
+Audio devices and network calls are mocked; no API key is needed. Results are saved
+under `tmp/performance-sweep/`. See [measurements and limitations](docs/performance-sweep.md).
+
 ### Headless integration test
 
 Use prerecorded speech to test wake → play → wake → pause → wake → resume → wake → stop. This runs the actual sherpa model, OpenAI Realtime command routing, YouTube Music search, and pygame decoding with SDL's silent output device. It needs the normal API key and internet connection, and uses no microphone or speakers.

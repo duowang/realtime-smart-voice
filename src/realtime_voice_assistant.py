@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import logging
 import signal
+from contextlib import AsyncExitStack
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -78,7 +79,7 @@ class RealtimeVoiceAssistant:
             self._log_event("TIMER_EXPIRED", timer["timer_id"])
             print(f"Timer finished: {timer['label']}")
 
-    def _tick_timer_alerts(self) -> None:
+    def _tick_timer_alerts(self) -> bool:
         self.timer_alerts.update()
         client = self.realtime_client
         # Don't compete with a speaking user, streamed response, or greeting.
@@ -97,11 +98,12 @@ class RealtimeVoiceAssistant:
             )
         ):
             self.timer_alerts.hush()
-            return
+            return bool(self._pending_timer_alerts)
         if self._pending_timer_alerts:
             pending = list(self._pending_timer_alerts.values())
             self._pending_timer_alerts.clear()
             self.timer_alerts.ring(pending)
+        return self.timer_alerts.is_ringing
 
     def _hush_timer_alerts(self) -> None:
         self._pending_timer_alerts.clear()
@@ -159,14 +161,17 @@ class RealtimeVoiceAssistant:
             )
             for offset in range(0, len(data), 1024):
                 await audio_operation(stream.write, data[offset : offset + 1024].tobytes())
-            await asyncio.sleep(0.3)
         except Exception as error:
             self._log_event(f"{log_prefix}_ERROR", f"Cannot play {description}: {error}")
         finally:
-            self._playing_prompt = False
-            close_stream(stream)
-            if audio is not None:
-                audio.terminate()
+            try:
+                # stop_stream drains PortAudio's pending output. No extra sleep
+                # is needed, and draining must not block other event-loop work.
+                await audio_operation(close_stream, stream)
+            finally:
+                self._playing_prompt = False
+                if audio is not None:
+                    audio.terminate()
 
     async def play_wake_word_acknowledgment(self) -> None:
         await self._play_audio_file(
@@ -239,27 +244,20 @@ class RealtimeVoiceAssistant:
             return
         self._cleaned_up = True
         self._shutting_down = True
-        try:
-            try:
-                if self.timer_service is not None:
-                    await self.timer_service.close()
-            finally:
-                try:
-                    if self.timer_alerts is not None:
-                        self._hush_timer_alerts()
-                finally:
-                    if self.realtime_client is not None:
-                        await self.realtime_client.cleanup()
-        finally:
-            try:
-                if self.wake_word_detector is not None:
-                    self.wake_word_detector.cleanup()
-            finally:
-                try:
-                    if self.music_handler is not None:
-                        self.music_handler.cleanup()
-                finally:
-                    self._close_logging()
+        # ExitStack runs every registered cleanup even when another one fails.
+        # Register in reverse order: timers, alerts, voice, wake detector, music.
+        async with AsyncExitStack() as cleanup:
+            cleanup.callback(self._close_logging)
+            if self.music_handler is not None:
+                cleanup.push_async_callback(self.music_handler.aclose)
+            if self.wake_word_detector is not None:
+                cleanup.callback(self.wake_word_detector.cleanup)
+            if self.realtime_client is not None:
+                cleanup.push_async_callback(self.realtime_client.cleanup)
+            if self.timer_alerts is not None:
+                cleanup.callback(self._hush_timer_alerts)
+            if self.timer_service is not None:
+                cleanup.push_async_callback(self.timer_service.close)
 
 
 async def main() -> int:

@@ -37,7 +37,7 @@ def test_natural_alert_end_releases_ducking(alerts):
     player, mixer = alerts
     player.ring([{"timer_id": "one"}])
     mixer.Sound.return_value.play.return_value.get_busy.return_value = False
-    player.update()
+    assert not player.update()
     assert player._channel is None
     player.duck_music.assert_called_with(False)
 

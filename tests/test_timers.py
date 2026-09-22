@@ -181,6 +181,82 @@ def test_failed_disk_write_preserves_previous_file_and_memory(setup, monkeypatch
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("operation", ["cancel", "expire"])
+def test_failed_state_change_preserves_published_records(setup, monkeypatch, operation):
+    service, clock, expired, removed = setup
+
+    async def run():
+        await service.execute("create_timer", {"duration_seconds": 1})
+        before = service._timers
+        saved = service.path.read_bytes()
+        monkeypatch.setattr(service, "_write", Mock(side_effect=OSError("disk full")))
+        if operation == "expire":
+            clock.advance(1)
+            with pytest.raises(OSError):
+                await service.poll()
+        else:
+            result = await service.execute("cancel_timer", {})
+            assert result["error"] == "storage_unavailable"
+        assert service._timers is before
+        assert all(t["state"] == "scheduled" for t in before.values())
+        assert service.path.read_bytes() == saved
+        expired.assert_not_called()
+        removed.assert_not_called()
+
+    asyncio.run(run())
+
+
+def test_scheduler_sleeps_until_change_and_uses_earliest_deadline(setup, monkeypatch):
+    service, clock, expired, _ = setup
+
+    async def run():
+        waits = asyncio.Queue()
+
+        async def observe_wait(awaitable, timeout):
+            waits.put_nowait(timeout)
+            await awaitable
+
+        # Observe the scheduler's requested sleep without using wall-clock timing.
+        monkeypatch.setattr("timers.asyncio.wait_for", observe_wait)
+        async with asyncio.timeout(2):
+            service.start()
+            assert await waits.get() is None
+            await service.execute("create_timer", {"duration_seconds": 60})
+            assert await waits.get() == 60
+            await service.execute("create_timer", {"duration_seconds": 10})
+            assert await waits.get() == 10
+            clock.advance(10)
+            service.tick = lambda: True  # An alert now needs periodic attention.
+            service._changed.set()
+            assert await waits.get() == 0.25
+            # Expiry is itself a committed change; it may trigger one more tick.
+            assert await waits.get() == 0.25
+            expired.assert_called_once()
+            service.tick = lambda: False
+            await service.execute("cancel_timer", {"timer_id": next(iter(service._timers))})
+            assert await waits.get() is None
+            await service.close()
+
+    asyncio.run(run())
+
+
+def test_scheduler_wakes_from_idle_and_expires_without_manual_poll(tmp_path):
+    async def run():
+        expired = asyncio.Event()
+        service = TimerService(tmp_path / "timers.json", on_expire=lambda _: expired.set())
+        service.start()
+        try:
+            await asyncio.sleep(0)
+            await service.execute("create_timer", {"duration_seconds": 1})
+            async with asyncio.timeout(3):
+                await expired.wait()
+        finally:
+            await service.close()
+        assert not [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+
+    asyncio.run(run())
+
+
 def test_cancelled_caller_still_publishes_committed_timer(setup, monkeypatch):
     service, clock, expired, _ = setup
     entered, release = threading.Event(), threading.Event()

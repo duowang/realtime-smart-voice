@@ -1,7 +1,6 @@
 """Persistent, application-owned countdowns; no audio or cloud dependencies."""
 
 import asyncio
-import copy
 import json
 import logging
 import math
@@ -68,6 +67,7 @@ TIMER_TOOLS = [
     ),
 ]
 TIMER_NAMES = {tool["name"] for tool in TIMER_TOOLS}
+TIMER_ARGUMENTS = {tool["name"]: set(tool["parameters"]["properties"]) for tool in TIMER_TOOLS}
 
 
 class TimerService:
@@ -85,7 +85,7 @@ class TimerService:
         *,
         on_expire: Callable = lambda _: None,
         on_remove: Callable = lambda _: None,
-        tick: Callable = lambda: None,
+        tick: Callable[[], bool] = lambda: False,
         wall_clock: Callable = time.time,
         clock: Callable = time.monotonic,
     ):
@@ -93,6 +93,7 @@ class TimerService:
         self.on_expire, self.on_remove, self.tick = on_expire, on_remove, tick
         self.wall_clock, self.clock = wall_clock, clock
         self._lock = asyncio.Lock()
+        self._changed = asyncio.Event()
         self._task = None
         self._closed = False
         self._timers = self._load()
@@ -167,6 +168,7 @@ class TimerService:
     async def _commit(self, records: dict) -> None:
         await asyncio.to_thread(self._write, records)
         self._timers = records
+        self._changed.set()
 
     def _view(self, record: dict) -> dict:
         return {
@@ -202,16 +204,10 @@ class TimerService:
         async with self._lock:
             if self._closed:
                 return self._result(False, "Timers are shutting down.", error="closed")
-            allowed = {
-                "create_timer": {"duration_seconds", "label"},
-                "get_timers": set(),
-                "cancel_timer": set(SELECTOR),
-                "dismiss_timer": set(SELECTOR),
-            }
             if (
-                name not in allowed
+                name not in TIMER_ARGUMENTS
                 or not isinstance(arguments, dict)
-                or set(arguments) - allowed[name]
+                or set(arguments) - TIMER_ARGUMENTS[name]
             ):
                 return self._result(False, "Invalid timer arguments.", error="invalid_arguments")
             if name == "get_timers":
@@ -223,7 +219,8 @@ class TimerService:
                 return self._result(
                     True, "Here are your timers." if visible else "No timers.", timers=visible
                 )
-            records = copy.deepcopy(self._timers)
+            # Published records are never mutated: copy only entries that change.
+            records = self._timers
             if name == "create_timer":
                 duration = arguments.get("duration_seconds")
                 label = arguments.get("label", "timer")
@@ -260,7 +257,7 @@ class TimerService:
                     "state": "scheduled",
                     "call_id": call_id,
                 }
-                records[timer_id] = timer
+                records = records | {timer_id: timer}
                 while len(records) > HISTORY_LIMIT:
                     old = next(
                         key
@@ -297,32 +294,30 @@ class TimerService:
                     timers=[self._view(t) for t in candidates],
                 )
             timer = candidates[0]
-            timer["state"] = "cancelled" if timer["state"] == "scheduled" else "dismissed"
-            await self._commit(records)
+            timer = timer | {"state": "cancelled" if timer["state"] == "scheduled" else "dismissed"}
+            await self._commit(records | {timer["id"]: timer})
             self.on_remove(timer["id"])
             return self._result(True, f"Timer {timer['state']}.", timer=self._view(timer))
 
-    async def poll(self) -> None:
+    async def poll(self) -> bool:
         """Expose one scheduler tick for deterministic tests without real sleeps."""
-        await complete_task(asyncio.create_task(self._poll()))
+        return await complete_task(asyncio.create_task(self._poll()))
 
-    async def _poll(self) -> None:
+    async def _poll(self) -> bool:
         async with self._lock:
             if self._closed:
-                return
-            records = copy.deepcopy(self._timers)
+                return False
+            now = self.clock()
             due = [
-                t
-                for t in records.values()
-                if t["state"] == "scheduled" and t["_deadline"] <= self.clock()
+                t | {"state": "expired"}
+                for t in self._timers.values()
+                if t["state"] == "scheduled" and t["_deadline"] <= now
             ]
             if due:
-                for timer in due:
-                    timer["state"] = "expired"
-                await self._commit(records)
+                await self._commit(self._timers | {t["id"]: t for t in due})
                 if not self._closed:
                     self.on_expire([self._view(t) for t in due])
-            self.tick()
+            return bool(self.tick())
 
     def start(self) -> None:
         if self._closed:
@@ -331,14 +326,34 @@ class TimerService:
             self._task = asyncio.create_task(self._run())
 
     async def _run(self) -> None:
+        """Sleep until a deadline/change; poll only while a chime needs attention.
+
+        tick returns true for an audible or deferred alert. The event is cleared
+        before polling so a concurrent committed change cannot lose its wake-up.
+        """
         while True:
+            self._changed.clear()
             try:
-                await self.poll()
+                needs_tick = await self.poll()
+                now = self.clock()
+                delay = min(
+                    (
+                        max(0, t["_deadline"] - now)
+                        for t in self._timers.values()
+                        if t["state"] == "scheduled"
+                    ),
+                    default=None,
+                )
+                if needs_tick:
+                    delay = POLL_INTERVAL if delay is None else min(delay, POLL_INTERVAL)
             except Exception:
                 # Keep saved timers available after an output or temporary disk failure.
                 logger.exception("Timer scheduler tick failed")
-                await asyncio.sleep(5)
-            await asyncio.sleep(POLL_INTERVAL)
+                delay = 5
+            try:
+                await asyncio.wait_for(self._changed.wait(), timeout=delay)
+            except TimeoutError:
+                pass
 
     async def close(self) -> None:
         self._closed = True
