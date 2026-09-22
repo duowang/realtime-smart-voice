@@ -23,20 +23,36 @@ def detector_module(monkeypatch, tmp_path):
         keyword_files.append(Path(kwargs["keywords_file"]).read_text())
         return spotter
 
-    monkeypatch.setitem(sys.modules, "pyaudio", types.SimpleNamespace(
-        PyAudio=Mock(return_value=audio), paInt16=8,
-    ))
-    monkeypatch.setitem(sys.modules, "sherpa_onnx", types.SimpleNamespace(
-        KeywordSpotter=Mock(side_effect=create_spotter),
-    ))
+    monkeypatch.setitem(
+        sys.modules,
+        "pyaudio",
+        types.SimpleNamespace(
+            PyAudio=Mock(return_value=audio),
+            paInt16=8,
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "sherpa_onnx",
+        types.SimpleNamespace(
+            KeywordSpotter=Mock(side_effect=create_spotter),
+        ),
+    )
     tokenizer = Mock()
     tokenizer.encode.side_effect = lambda text, out_type: {
-        "HI TACO": ["▁HI", "▁TA", "CO"], "HELLO": ["▁HELLO"],
+        "HI TACO": ["▁HI", "▁TA", "CO"],
+        "HELLO": ["▁HELLO"],
     }.get(text, ["<unk>"])
-    monkeypatch.setitem(sys.modules, "sentencepiece", types.SimpleNamespace(
-        SentencePieceProcessor=Mock(return_value=tokenizer),
-    ))
-    spec = importlib.util.spec_from_file_location("tested_wake_detector", SRC_DIR / "wake_word_detector.py")
+    monkeypatch.setitem(
+        sys.modules,
+        "sentencepiece",
+        types.SimpleNamespace(
+            SentencePieceProcessor=Mock(return_value=tokenizer),
+        ),
+    )
+    spec = importlib.util.spec_from_file_location(
+        "tested_wake_detector", SRC_DIR / "wake_word_detector.py"
+    )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     tokenizer_path = tmp_path / "bpe.model"
@@ -123,8 +139,7 @@ def test_cleanup_closes_audio_even_if_stop_fails(detector_module):
     asyncio.run(detector.start_listening())
     microphone = detector.stream
     microphone.stop_stream.side_effect = OSError("device disconnected")
-    with pytest.raises(OSError):
-        detector.cleanup()
+    detector.cleanup()
     microphone.close.assert_called_once()
     audio.terminate.assert_called_once()
     assert not detector.is_listening

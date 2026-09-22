@@ -56,32 +56,6 @@ compute_sha256() {
     fi
 }
 
-config_has_nonempty_key() {
-    local key="$1"
-    "$PYTHON_BIN" - "$key" <<'PY'
-import json
-import pathlib
-import sys
-
-config_path = pathlib.Path("config/config.json")
-if not config_path.exists():
-    print("0")
-    raise SystemExit(0)
-
-try:
-    data = json.loads(config_path.read_text(encoding="utf-8"))
-except Exception:
-    print("0")
-    raise SystemExit(0)
-
-value = data.get(sys.argv[1])
-if isinstance(value, str) and value.strip():
-    print("1")
-else:
-    print("0")
-PY
-}
-
 echo -e "${BLUE}=== Realtime Smart Voice Assistant ===${NC}"
 
 if ! command_exists "$PYTHON_BIN"; then
@@ -179,43 +153,16 @@ if [[ "$SETUP_ONLY" == "true" ]]; then
     exit 0
 fi
 
-if [[ ! -f ".env" && -f ".env.example" ]]; then
-    log_info "No .env found. Creating from .env.example..."
-    cp .env.example .env
-    echo
-    log_info "Edit .env and add:"
-    echo "  OPENAI_API_KEY=..."
-    echo
-    log_err "Exiting until .env is configured."
-    exit 1
+# Python parses .env without executing it and validates the selected --config.
+# Environment-only keys work without a .env file.
+if [[ ! -f ".env" && -f ".env.example" && -z "${OPENAI_API_KEY:-}" ]]; then
+    (umask 077; cp .env.example .env)
+    log_info "Created .env template; add OPENAI_API_KEY if it is not in your config."
 fi
 
-# Load environment variables safely.
-if [[ -f ".env" ]]; then
-    set -a
-    # shellcheck disable=SC1091
-    source .env
-    set +a
-    log_ok "Loaded environment variables from .env"
-fi
-
-OPENAI_IN_CONFIG="$(config_has_nonempty_key openai_api_key)"
-if [[ -z "${OPENAI_API_KEY:-}" && "$OPENAI_IN_CONFIG" != "1" ]]; then
-    log_err "ERROR: OpenAI API key is required."
-    echo "Add OPENAI_API_KEY to .env or set config/config.json: openai_api_key"
-    echo "Get key from: https://platform.openai.com/api-keys"
-    exit 1
-fi
-
-echo -e "${GREEN}Starting Realtime Voice Assistant with YouTube Music support...${NC}"
-echo -e "${YELLOW}Say 'Hi Taco' to start a conversation${NC}"
-echo -e "${YELLOW}Music commands: 'play [song]', 'pause', 'resume', 'stop music'${NC}"
-echo -e "${YELLOW}Press Ctrl+C to exit${NC}"
-echo
-
-cd src
+log_ok "Starting Realtime Voice Assistant..."
 if [[ ${#ASSISTANT_ARGS[@]} -gt 0 ]]; then
-    exec python realtime_voice_assistant.py "${ASSISTANT_ARGS[@]}"
+    exec python src/realtime_voice_assistant.py "${ASSISTANT_ARGS[@]}"
 else
-    exec python realtime_voice_assistant.py
+    exec python src/realtime_voice_assistant.py
 fi

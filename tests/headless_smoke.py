@@ -1,7 +1,7 @@
 """Live integration check using WAV input and SDL's silent music output.
 
-Run directly in a separate process, not through pytest: the unit tests replace
-imported modules, whereas this check needs the real model, network and mixer.
+Run directly in a separate process: this check needs the real model, network
+and mixer, unlike the offline pytest suite.
 Requires the normal OpenAI key and network access to OpenAI/YouTube Music.
 """
 
@@ -32,7 +32,10 @@ def read_pcm(path: Path, rate: int) -> bytes:
     with wave.open(str(path), "rb") as source:
         if (source.getnchannels(), source.getsampwidth(), source.getframerate()) != (1, 2, rate):
             raise ValueError(f"{path} must be mono PCM16 at {rate} Hz")
-        return source.readframes(source.getnframes())
+        pcm = source.readframes(source.getnframes())
+        if not pcm:
+            raise ValueError(f"{path} is empty")
+        return pcm
 
 
 class FileStream:
@@ -51,7 +54,7 @@ class FileStream:
             raise OSError("read after stream close")
         if self.realtime:
             time.sleep(frames / self.rate)
-        chunk = self.pcm[self.cursor:self.cursor + frames * 2]
+        chunk = self.pcm[self.cursor : self.cursor + frames * 2]
         self.cursor += frames * 2
         return chunk.ljust(frames * 2, b"\0")
 
@@ -74,7 +77,9 @@ class FileAudio:
         self.owned = []
 
     def open(self, *, rate, input=False, **_):
-        stream = FileStream(self.inputs.get(rate, b"") if input else b"", rate, input and rate == 24000)
+        stream = FileStream(
+            self.inputs.get(rate, b"") if input else b"", rate, input and rate == 24000
+        )
         self.owned.append(stream)
         self.streams.append(stream)
         return stream
@@ -86,12 +91,18 @@ class FileAudio:
 
 async def run(args):
     wake_pcm = read_pcm(args.wake_audio, 16000)
-    commands = {name: read_pcm(args.commands_dir / f"{name}.wav", 24000)
-                for name in ("play", "pause", "resume", "stop")}
+    commands = {
+        name: read_pcm(args.commands_dir / f"{name}.wav", 24000)
+        for name in ("play", "pause", "resume", "stop")
+    }
     background = read_pcm(args.background_audio, 16000) if args.background_audio else None
     inputs, streams, events = {}, [], []
-    report = {"checks": [], "audio_driver": "SDL dummy", "live_services": True,
-              "background_snr_db": args.snr_db if background else None}
+    report = {
+        "checks": [],
+        "audio_driver": "SDL dummy",
+        "live_services": True,
+        "background_snr_db": args.snr_db if background else None,
+    }
 
     class HeadlessAssistant(RealtimeVoiceAssistant):
         def _setup_logging(self):
@@ -110,11 +121,13 @@ async def run(args):
         if background and status["is_playing"] and not status["is_paused"]:
             # Controlled digital mixture; physical room acoustics aren't simulated.
             speech = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
-            voice_rms = np.sqrt(np.mean(speech ** 2))
+            voice_rms = np.sqrt(np.mean(speech**2))
             # Continuous music is present before and after the spoken phrase.
             speech = np.pad(speech, (16000, 16000))
-            music = np.resize(np.frombuffer(background, dtype=np.int16), speech.size).astype(np.float32)
-            music_rms = np.sqrt(np.mean(music ** 2))
+            music = np.resize(np.frombuffer(background, dtype=np.int16), speech.size).astype(
+                np.float32
+            )
+            music_rms = np.sqrt(np.mean(music**2))
             if voice_rms > 0 and music_rms > 0:
                 music *= voice_rms / music_rms / 10 ** (args.snr_db / 20)
             pcm = np.clip(speech + music, -32768, 32767).astype(np.int16).tobytes()
@@ -134,8 +147,8 @@ async def run(args):
             assistant = HeadlessAssistant(str(args.config))
             player = assistant.music_handler.music_player
             # Album art isn't part of the audio/control test.
-            player._download_thumbnail = AsyncMock(return_value=None)
-            player._render_thumbnail_in_terminal = lambda *_: None
+            player.album_art.download = AsyncMock(return_value=None)
+            player.album_art.render = lambda *_: None
             for name in ("play", "pause", "resume", "stop"):
                 detected = await wake(assistant)
                 record(f"wake before {name}", phrase=detected)
@@ -147,7 +160,9 @@ async def run(args):
                 calls = [message for kind, message in turn_events if kind == "FUNCTION_CALL"]
                 if not any(message.startswith(expected_function + "(") for message in calls):
                     transcripts = [m for k, m in turn_events if k == "USER_TRANSCRIPT"]
-                    raise AssertionError(f"Expected {expected_function}; got calls={calls}, transcripts={transcripts}")
+                    raise AssertionError(
+                        f"Expected {expected_function}; got calls={calls}, transcripts={transcripts}"
+                    )
 
                 status = player.get_status()
                 await asyncio.sleep(0.2)
@@ -161,15 +176,20 @@ async def run(args):
                 elif name == "pause":
                     assert status["is_playing"] and status["is_paused"] and not busy
                     assert next_position == position, "Paused playback clock advanced"
-                    assert player.playback_thread.is_alive(), "Paused track lost its playback thread"
-                    assert not player.was_paused_for_conversation, "Explicit pause would auto-resume"
+                    assert not player.was_paused_for_conversation, (
+                        "Explicit pause would auto-resume"
+                    )
                 else:
                     assert not status["is_playing"] and not status["is_paused"] and not busy
                     assert status["current_song"] is None
-                    assert not player.playback_thread.is_alive(), "Stopped playback thread is still alive"
                     assert not await assistant.music_handler.resume_after_conversation()
-                record(name, function=expected_function, mixer_busy=busy,
-                       position_ms=position, next_position_ms=next_position)
+                record(
+                    name,
+                    function=expected_function,
+                    mixer_busy=busy,
+                    position_ms=position,
+                    next_position_ms=next_position,
+                )
 
             await wake(assistant)
             assert not pygame.mixer.music.get_busy()
@@ -196,14 +216,26 @@ async def run(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--wake-audio", type=Path, required=True, help="Mono PCM16 wake phrase at 16 kHz")
-    parser.add_argument("--commands-dir", type=Path, required=True,
-                        help="Mono PCM16 24 kHz play.wav, pause.wav, resume.wav and stop.wav")
+    parser.add_argument(
+        "--wake-audio", type=Path, required=True, help="Mono PCM16 wake phrase at 16 kHz"
+    )
+    parser.add_argument(
+        "--commands-dir",
+        type=Path,
+        required=True,
+        help="Mono PCM16 24 kHz play.wav, pause.wav, resume.wav and stop.wav",
+    )
     parser.add_argument("--background-audio", type=Path, help="Optional mono PCM16 music at 16 kHz")
-    parser.add_argument("--snr-db", type=float, default=5,
-                        help="Speech/music ratio in the digital wake-word mixture (default: 5 dB)")
+    parser.add_argument(
+        "--snr-db",
+        type=float,
+        default=5,
+        help="Speech/music ratio in the digital wake-word mixture (default: 5 dB)",
+    )
     parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "config" / "config.json")
-    parser.add_argument("--timeout", type=float, default=45, help="Maximum seconds per conversation")
+    parser.add_argument(
+        "--timeout", type=float, default=45, help="Maximum seconds per conversation"
+    )
     parser.add_argument("--report", type=Path, help="Optional JSON result file; keep it out of Git")
     args = parser.parse_args()
     return asyncio.run(run(args))

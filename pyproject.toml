@@ -1,11 +1,12 @@
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
 python_files = ["test_*.py"]
 addopts = "-q"
 
 [tool.ruff]
 line-length = 100
-target-version = "py39"
+target-version = "py312"
 src = ["src", "tests"]
 
 [tool.ruff.lint]

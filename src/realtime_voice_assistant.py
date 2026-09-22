@@ -1,347 +1,205 @@
 #!/usr/bin/env python3
+"""Coordinate wake detection, conversation handoff and application shutdown."""
 
+import argparse
 import asyncio
-import json
 import logging
-import os
 import signal
-import sys
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 import numpy as np
 import pyaudio
 import soundfile as sf
-from dotenv import load_dotenv
 
+from audio_io import audio_operation, close_stream
+from configuration import DEFAULT_CONFIG_FILE, PROJECT_ROOT, get_api_key, load_config
 from music_commands import MusicCommandHandler
 from realtime_voice_client import RealtimeVoiceClient
 from wake_word_detector import WakeWordDetector
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_CONFIG_FILE = os.path.join(PROJECT_ROOT, "config", "config.json")
-
 
 class RealtimeVoiceAssistant:
-    """Main realtime voice assistant using wake word detection + OpenAI Realtime API"""
-    
-    def __init__(self, config_file: str = DEFAULT_CONFIG_FILE):
-        """Initialize the realtime voice assistant"""
-        # Load environment variables from .env file
-        self._load_env_vars()
-        
-        self.config = self._load_config(config_file)
+    def __init__(self, config_file: str | Path = DEFAULT_CONFIG_FILE):
+        self.config = load_config(config_file)
+        get_api_key(self.config)  # Validate before downloading models or opening devices.
         self.running = False
-        
-        # Initialize logging
+        self._shutting_down = False
+        self._cleaned_up = False
+        self.music_handler = None
+        self.wake_word_detector = None
+        self.realtime_client = None
         self._setup_logging()
-        
-        # Initialize components
-        print("Initializing realtime voice assistant...")
-        
-        # Music command handler (shared across components)
-        self.music_handler = MusicCommandHandler(
-            self._log_event, music_volume=self.config.get("music_volume")
-        )
-        
-        # Wake word detector
-        self.wake_word_detector = WakeWordDetector(self.config, self._log_event)
-        
-        # Realtime voice client
-        self.realtime_client = RealtimeVoiceClient(self.config, self._log_event, self.music_handler)
-        
-        print("Realtime voice assistant initialized successfully!")
-    
-    def _load_env_vars(self):
-        """Load environment variables from .env file"""
-        # Look for .env file in parent directory (project root)
-        env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env')
-        if os.path.exists(env_path):
-            load_dotenv(env_path)
-            print(f"Loaded environment variables from: {env_path}")
-        else:
-            print("No .env file found - using system environment variables")
-        
-    def _load_config(self, config_file: str) -> dict:
-        """Load configuration from JSON file"""
         try:
-            with open(config_file) as f:
-                return json.load(f)
-        except FileNotFoundError:
-            print(f"Config file not found: {config_file}")
-            return {}
-        except json.JSONDecodeError as e:
-            print(f"Error parsing config file: {e}")
-            return {}
-    
-    def _setup_logging(self):
-        """Setup logging for the assistant"""
-        # Create logs directory if it doesn't exist
-        log_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'logs')
-        os.makedirs(log_dir, exist_ok=True)
-        
-        # Setup logger
-        self.logger = logging.getLogger('realtime_voice_assistant')
+            self.music_handler = MusicCommandHandler(
+                self._log_event, self.config.get("music_volume")
+            )
+            self.realtime_client = RealtimeVoiceClient(
+                self.config, self._log_event, self.music_handler
+            )
+            self.wake_word_detector = WakeWordDetector(self.config, self._log_event)
+        except BaseException:
+            # Constructors acquire no realtime audio/socket resources. Release the
+            # components already built if a later constructor fails.
+            if self.wake_word_detector is not None:
+                self.wake_word_detector.cleanup()
+            if self.music_handler is not None:
+                self.music_handler.cleanup()
+            self._close_logging()
+            raise
+
+    def _setup_logging(self) -> None:
+        directory = PROJECT_ROOT / "logs"
+        directory.mkdir(exist_ok=True)
+        # An instance owns its handler; constructing another assistant must not
+        # clear or close the first one's handlers.
+        self.logger = logging.getLogger(f"realtime_voice_assistant.{id(self)}")
         self.logger.setLevel(logging.INFO)
-        
-        # Remove existing handlers
-        self.logger.handlers.clear()
-        
-        # Create file handler
-        log_file = os.path.join(log_dir, 'realtime_voice_assistant.log')
-        file_handler = logging.FileHandler(log_file, encoding='utf-8')
-        
-        # Create formatter
-        formatter = logging.Formatter(
-            '%(asctime)s | %(name)s | %(message)s', 
-            datefmt='%Y-%m-%d %H:%M:%S'
+        self.logger.propagate = False
+        self._log_handler = RotatingFileHandler(
+            directory / "realtime_voice_assistant.log",
+            maxBytes=5_000_000,
+            backupCount=2,
+            encoding="utf-8",
         )
-        file_handler.setFormatter(formatter)
-        
-        # Add handler
-        self.logger.addHandler(file_handler)
-        
-        print(f"Logging setup complete. Log file: {log_file}")
-    
-    def _log_event(self, event_type: str, message: str):
-        """Log events from components"""
+        self._log_handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
+        self.logger.addHandler(self._log_handler)
+
+    def _close_logging(self) -> None:
+        handler = getattr(self, "_log_handler", None)
+        if handler is not None:
+            self.logger.removeHandler(handler)
+            handler.close()
+            self._log_handler = None
+
+    def _log_event(self, kind: str, message: str) -> None:
+        self.logger.info("%s: %s", kind, message)
+
+    async def _play_audio_file(self, path: str | Path, description: str, log_prefix: str) -> None:
+        audio = stream = None
         try:
-            self.logger.info(f"{event_type}: {message}")
-        except Exception as e:
-            print(f"Error logging event: {e}")
-
-    async def _play_audio_file(self, audio_file_path: str, description: str, log_prefix: str):
-        """
-        Shared method to play an audio file
-
-        Args:
-            audio_file_path: Path to the audio file
-            description: Description for logging/printing
-            log_prefix: Prefix for log events (e.g., "WAKE_WORD_ACK", "BYE_BYE")
-        """
-        print(f"{description}...")
-        try:
-            # Check if audio file exists
-            if not os.path.exists(audio_file_path):
-                print(f"Audio file not found: {audio_file_path}")
-                self._log_event(f"{log_prefix}_ERROR", f"Audio file not found: {audio_file_path}")
-                return
-
-            # Load audio file
-            audio_data, sample_rate = sf.read(audio_file_path)
-
-            # Create PyAudio instance
-            p = pyaudio.PyAudio()
-
-            # Determine channels
-            channels = 1 if len(audio_data.shape) == 1 else audio_data.shape[1]
-
-            # Open stream with proper settings
-            stream = p.open(
+            data, rate = sf.read(path, dtype="float32", always_2d=True)
+            if not data.size:
+                raise ValueError("Audio prompt is empty")
+            peak = float(np.max(np.abs(data)))
+            if peak > 1:
+                data /= peak
+            audio = pyaudio.PyAudio()
+            stream = audio.open(
                 format=pyaudio.paFloat32,
-                channels=channels,
-                rate=int(sample_rate),
+                channels=data.shape[1],
+                rate=int(rate),
                 output=True,
-                frames_per_buffer=1024
+                frames_per_buffer=1024,
+            )
+            for offset in range(0, len(data), 1024):
+                await audio_operation(stream.write, data[offset : offset + 1024].tobytes())
+            await asyncio.sleep(0.3)
+        except Exception as error:
+            self._log_event(f"{log_prefix}_ERROR", f"Cannot play {description}: {error}")
+        finally:
+            close_stream(stream)
+            if audio is not None:
+                audio.terminate()
+
+    async def play_wake_word_acknowledgment(self) -> None:
+        await self._play_audio_file(
+            PROJECT_ROOT / "audio" / "hi_there.wav", "greeting", "WAKE_WORD_ACK"
+        )
+
+    async def play_bye_bye_sound(self) -> None:
+        if not self.music_handler.get_status()["is_playing"]:
+            await self._play_audio_file(
+                PROJECT_ROOT / "audio" / "bye_bye.wav", "goodbye", "BYE_BYE"
             )
 
-            # Convert to float32 if needed
-            if audio_data.dtype != np.float32:
-                audio_data = audio_data.astype(np.float32)
-
-            # Ensure audio is in the right range for float32 (-1.0 to 1.0)
-            if np.max(np.abs(audio_data)) > 1.0:
-                audio_data = audio_data / np.max(np.abs(audio_data))
-
-            # Play audio in chunks to avoid buffer issues
-            chunk_size = 1024
-            for i in range(0, len(audio_data), chunk_size):
-                chunk = audio_data[i:i + chunk_size]
-                stream.write(chunk.tobytes())
-
-            # Cleanup
-            stream.stop_stream()
-            stream.close()
-            p.terminate()
-
-            # Add delay after audio playback
-            await asyncio.sleep(0.3)
-
-        except Exception as e:
-            print(f"Error playing {description}: {e}")
-            import traceback
-            traceback.print_exc()
-            self._log_event(f"{log_prefix}_ERROR", f"Failed to play {description}: {e}")
-
-    async def play_wake_word_acknowledgment(self):
-        """Play acknowledgment after wake word detection using static audio file"""
-        audio_file_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'audio', 'hi_there.wav')
-        await self._play_audio_file(audio_file_path, "Wake word detected! Playing acknowledgment", "WAKE_WORD_ACK")
-        print("Starting conversation...")
-    
-    async def play_bye_bye_sound(self):
-        """Play ByeBye sound after conversation ends (skip if music is playing)"""
-        # Check if music is currently playing
+    async def handle_wake_word_detection(self) -> None:
         try:
-            music_status = self.music_handler.get_status()
-            if music_status.get('is_playing', False):
-                print("Music is playing, skipping ByeBye sound...")
-                self._log_event("BYE_BYE_SKIP", "Skipped ByeBye sound due to active music playback")
-                return
-        except Exception as e:
-            print(f"Error checking music status: {e}")
-            # Continue with ByeBye sound if we can't check music status
+            # Cover greeting, connection setup, tool work, and the conversation.
+            async with asyncio.timeout(self.config.get("conversation_timeout", 120)):
+                await self.music_handler.pause_for_conversation()
+                await self.play_wake_word_acknowledgment()
+                self._log_event("CONVERSATION_START", "Starting conversation after wake word")
+                await self.realtime_client.start_conversation()
+        except TimeoutError:
+            self._log_event("CONVERSATION_TIMEOUT", "Returning to wake-word detection")
+        except Exception as error:
+            self._log_event("CONVERSATION_ERROR", str(error))
+            print(f"Conversation failed: {error}")
+        finally:
+            # Also restores an automatic pause when greeting/connection setup fails.
+            await self.realtime_client.stop_conversation(resume_music=not self._shutting_down)
 
-        audio_file_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'audio', 'bye_bye.wav')
-        await self._play_audio_file(audio_file_path, "Playing ByeBye sound", "BYE_BYE")
-    
-    async def handle_wake_word_detection(self):
-        """Handle wake word detection and start realtime conversation"""
-        try:
-            # Silence music immediately so the greeting and next command are audible.
-            await self.music_handler.pause_for_conversation()
-            # Play acknowledgment
-            await self.play_wake_word_acknowledgment()
-            
-            # Start realtime conversation — the hi_there.wav acknowledgment
-            # already greets the user, so no text greeting needed
-            await self.realtime_client.start_conversation()
-
-            self._log_event("CONVERSATION_START", "Started realtime conversation after wake word")
-            
-        except Exception as e:
-            print(f"Error handling wake word detection: {e}")
-            self._log_event("CONVERSATION_ERROR", f"Failed to start conversation: {e}")
-            await self.realtime_client.stop_conversation()
-    
-    async def run_continuous_mode(self):
-        """Run in continuous listening mode"""
-        print("\n=== Realtime Voice Assistant Started ===")
-        print(f"Wake word: {self.wake_word_detector.wake_keywords[0]}")
-        print("Say the wake word to start a conversation.")
-        print("The assistant will use OpenAI's Realtime API for natural conversation.")
-        print("Press Ctrl+C to exit.\n")
-        
+    async def run_continuous_mode(self) -> None:
+        print(
+            f"Listening for {', '.join(self.wake_word_detector.wake_keywords)}. Press Ctrl+C to exit."
+        )
         self.running = True
         loop = asyncio.get_running_loop()
-        shutdown_requested = False
-        
-        # Setup signal handlers
-        async def request_shutdown():
-            """Stop active components promptly after a shutdown signal."""
-            try:
-                if hasattr(self, 'realtime_client'):
-                    self.realtime_client.conversation_should_end = True
-                    if self.realtime_client.is_connected:
-                        await self.realtime_client.stop_conversation()
-            except Exception as e:
-                self._log_event("SYSTEM_ERROR", f"Error stopping realtime client on shutdown: {e}")
+        owner = asyncio.current_task()
+        previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
 
-            try:
-                if hasattr(self, 'wake_word_detector') and self.wake_word_detector.is_listening:
-                    await self.wake_word_detector.stop_listening()
-            except Exception as e:
-                self._log_event("SYSTEM_ERROR", f"Error stopping wake word detector on shutdown: {e}")
+        def request_shutdown():
+            if not self._shutting_down:
+                self._shutting_down = True
+                self.running = False
+                self.realtime_client.request_stop(resume_music=False)
+                owner.cancel()
 
-        def signal_handler(signum, frame):
-            nonlocal shutdown_requested
-            if shutdown_requested:
-                return
-            shutdown_requested = True
-            print("\nShutdown signal received...")
-            self.running = False
-            loop.call_soon_threadsafe(lambda: asyncio.create_task(request_shutdown()))
-        
-        previous_sigint = signal.getsignal(signal.SIGINT)
-        previous_sigterm = signal.getsignal(signal.SIGTERM)
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
-        
+        for sig in previous:
+            loop.add_signal_handler(sig, request_shutdown)
         try:
             while self.running:
-                # Listen for wake word
-                detected_keyword = await self.wake_word_detector.listen_for_wake_word()
-                
-                if detected_keyword and self.running:
-                    print(f"Wake word '{detected_keyword}' detected!")
-                    
-                    # Handle wake word detection
+                keyword = await self.wake_word_detector.listen_for_wake_word()
+                if keyword:
                     await self.handle_wake_word_detection()
-                    
-                    # Wait for conversation to complete or timeout
-                    conversation_timeout = self.config.get("conversation_timeout", 120)
-                    try:
-                        await asyncio.wait_for(
-                            self._wait_for_conversation_end(),
-                            timeout=conversation_timeout
-                        )
-                    except asyncio.TimeoutError:
-                        print("Conversation timed out, returning to wake word detection")
-                        await self.realtime_client.stop_conversation()
-                    
-                    # Play ByeBye sound after conversation ends
                     await self.play_bye_bye_sound()
-                    
-                    print("\nReady for next wake word...")
-                
-                # Small delay to prevent busy waiting
-                await asyncio.sleep(0.01)
-                
-        except KeyboardInterrupt:
-            print("\nKeyboard interrupt detected")
-        except Exception as e:
-            print(f"Error in continuous mode: {e}")
-            self._log_event("SYSTEM_ERROR", f"Continuous mode error: {e}")
+                    print("Ready for next wake word.")
+        except asyncio.CancelledError:
+            if not self._shutting_down:
+                raise
         finally:
-            signal.signal(signal.SIGINT, previous_sigint)
-            signal.signal(signal.SIGTERM, previous_sigterm)
+            self.running = False
+            self._shutting_down = True
+            for sig, handler in previous.items():
+                loop.remove_signal_handler(sig)
+                signal.signal(sig, handler)
             await self.cleanup()
-    
-    async def _wait_for_conversation_end(self):
-        """Wait for conversation to end"""
-        # Wait for the realtime client to indicate conversation should end
-        while (self.realtime_client.is_connected and 
-               not self.realtime_client.conversation_should_end and 
-               self.running):
-            await asyncio.sleep(0.1)
-    
-    async def cleanup(self):
-        """Clean up resources"""
-        print("\nCleaning up...")
-        
-        # Stop realtime client
-        if hasattr(self, 'realtime_client'):
-            await self.realtime_client.stop_conversation()
-            self.realtime_client.cleanup()
-        
-        # Stop wake word detector
-        if hasattr(self, 'wake_word_detector'):
-            await self.wake_word_detector.stop_listening()
-            self.wake_word_detector.cleanup()
-        
-        # Cleanup music handler
-        if hasattr(self, 'music_handler'):
-            self.music_handler.cleanup()
-        
-        print("Realtime voice assistant stopped.")
+
+    async def cleanup(self) -> None:
+        if self._cleaned_up:
+            return
+        self._cleaned_up = True
+        self._shutting_down = True
+        try:
+            if self.realtime_client is not None:
+                await self.realtime_client.cleanup()
+        finally:
+            try:
+                if self.wake_word_detector is not None:
+                    self.wake_word_detector.cleanup()
+            finally:
+                try:
+                    if self.music_handler is not None:
+                        self.music_handler.cleanup()
+                finally:
+                    self._close_logging()
 
 
-async def main():
-    """Main function"""
-    import argparse
-    
-    parser = argparse.ArgumentParser(description="Realtime Smart Voice Assistant")
-    parser.add_argument("--config", default=DEFAULT_CONFIG_FILE,
-                       help="Configuration file path")
-    
+async def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--config", type=Path, default=DEFAULT_CONFIG_FILE, help="Configuration file"
+    )
     args = parser.parse_args()
-    
     try:
-        assistant = RealtimeVoiceAssistant(config_file=args.config)
+        assistant = RealtimeVoiceAssistant(args.config)
         await assistant.run_continuous_mode()
-        
-    except Exception as e:
-        print(f"Error starting realtime voice assistant: {e}")
-        sys.exit(1)
+    except Exception as error:
+        print(f"Assistant failed: {error}")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    raise SystemExit(asyncio.run(main()))

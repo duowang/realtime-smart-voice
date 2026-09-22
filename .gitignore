@@ -1,5 +1,6 @@
 # Environment variables (contains API keys)
-.env
+.env*
+!.env.example
 
 # Python
 __pycache__/
@@ -50,7 +51,7 @@ ehthumbs.db
 Thumbs.db
 
 # Logs
-logs/*.log
+logs/*.log*
 *.log
 
 # Audio files (temporary)

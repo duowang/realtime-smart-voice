@@ -1,95 +1,105 @@
+"""OpenAI Realtime transport with explicitly owned audio and conversation tasks."""
+
 import asyncio
 import base64
 import json
 import logging
-import os
 import re
 import time
-from typing import Callable, Optional
+from urllib.parse import quote
 
-import numpy as np
 import pyaudio
 import websockets
+from websockets.exceptions import ConnectionClosedOK
 
+from audio_io import audio_operation, close_stream, complete_task
+from configuration import get_api_key
 from music_commands import MusicCommandHandler
+
+SAMPLE_RATE = 24000
+INPUT_FRAMES = 1024
+OUTPUT_FRAMES = 480  # 20 ms limits the amount of uninterruptible device output.
 
 
 class RealtimeVoiceClient:
-    """Handles real-time conversation using OpenAI Realtime API"""
-
     DEFAULT_REALTIME_MODEL = "gpt-realtime-2.1"
     DEFAULT_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe"
     DEFAULT_REALTIME_VOICE = "marin"
     VALID_REALTIME_VOICES = {
-        "alloy", "ash", "ballad", "coral", "echo",
-        "sage", "shimmer", "verse", "marin", "cedar"
+        "alloy",
+        "ash",
+        "ballad",
+        "coral",
+        "echo",
+        "sage",
+        "shimmer",
+        "verse",
+        "marin",
+        "cedar",
     }
-    
-    def __init__(self, config: dict, log_function: Optional[Callable] = None, music_handler: Optional['MusicCommandHandler'] = None):
-        """
-        Initialize realtime voice client
-        
-        Args:
-            config: Configuration dictionary
-            log_function: Optional logging function
-            music_handler: Optional music command handler for pause/resume control
-        """
+
+    def __init__(self, config: dict, log_function=None, music_handler=None):
         self.config = config
         self.log_function = log_function
-        self.websocket = None
-        self.is_connected = False
+        self.api_key = get_api_key(config)
+        self._owns_music = music_handler is None
+        self.music_handler = (
+            music_handler
+            if music_handler is not None
+            else MusicCommandHandler(log_function, music_volume=config.get("music_volume"))
+        )
         self.audio = None
         self.stream = None
+        self.output_stream = None
+        self.websocket = None
+        self._conversation_task = None
+        self._stop_event = asyncio.Event()
+        self._closed = False
+        self._resume_music = True
+        self.is_connected = False
         self.conversation_should_end = False
-        self.last_activity_time = None
-        self.last_user_activity_time = None
-        self.is_assistant_speaking = False
+        self.end_phrases = {
+            "goodbye",
+            "bye",
+            "see you later",
+            "talk to you later",
+            "that's all",
+            "thanks",
+            "thank you",
+            "stop",
+            "end conversation",
+            "quit",
+            "exit",
+            "done",
+            "finished",
+        }
+        self._reset_turn_state()
+
+    def _log(self, kind: str, message: str) -> None:
+        if self.log_function:
+            self.log_function(kind, message)
+        else:
+            logging.getLogger(__name__).info("[%s] %s", kind, message)
+
+    def _init_audio(self) -> None:
+        if self.audio is None:
+            self.audio = pyaudio.PyAudio()
+
+    def _reset_turn_state(self) -> None:
+        self.last_user_activity_time = time.monotonic()
         self._assistant_finished_time = None
         self._assistant_text_buffer = ""
-        self._consecutive_assistant_turns = 0
-        self._max_consecutive_turns = 2
-        self._noise_transcript_count = 0
-
-        # Get API key
-        self.api_key = config.get("openai_api_key") or os.getenv("OPENAI_API_KEY")
-        if not self.api_key:
-            raise ValueError("OpenAI API key is required for realtime voice")
-        
-        # End conversation phrases
-        self.end_phrases = [
-            "goodbye", "bye", "see you later", "talk to you later", 
-            "that's all", "thanks", "thank you", "stop", "end conversation",
-            "quit", "exit", "done", "finished"
-        ]
-        
-        # Configure logging
-        self._setup_logging()
-        
-        # Initialize audio
-        self._init_audio()
-        
-        # Use provided music handler or create new one
-        self.music_handler = music_handler or MusicCommandHandler(
-            log_function, music_volume=config.get("music_volume")
-        )
-        
-    def _setup_logging(self):
-        """Setup logging for the realtime client"""
-        self.logger = logging.getLogger(__name__)
-        
-    def _log(self, log_type: str, message: str):
-        """Log message if logging function is available"""
-        if self.log_function:
-            try:
-                self.log_function(log_type, message)
-            except Exception as e:
-                print(f"Error logging realtime event: {e}")
-        else:
-            self.logger.info(f"[{log_type}] {message}")
-    
-    def _init_audio(self):
-        """Initialize PyAudio for microphone input and speaker output"""
-        self.audio = pyaudio.PyAudio()
+        self._response_in_progress = False
+        self._user_speaking = False
+        self.is_assistant_speaking = False
+        self._output_queue = asyncio.Queue(maxsize=3000)
+        self._output_idle = asyncio.Event()
+        self._output_idle.set()
+        self._output_epoch = 0
+        self._played_item = None
+        self._played_content_index = 0
+        self._played_bytes = 0
+        self._tool_in_progress = False
 
     def _get_realtime_model(self) -> str:
         """Return the configured Realtime model name."""
@@ -103,17 +113,14 @@ class RealtimeVoiceClient:
 
         self._log(
             "REALTIME_CONFIG",
-            f"Unsupported realtime voice '{voice}', falling back to '{self.DEFAULT_REALTIME_VOICE}'"
+            f"Unsupported realtime voice '{voice}', falling back to '{self.DEFAULT_REALTIME_VOICE}'",
         )
         return self.DEFAULT_REALTIME_VOICE
 
     def _build_transcription_config(self) -> dict:
         """Build optional realtime transcription settings."""
         transcription_config = {
-            "model": self.config.get(
-                "transcription_model",
-                self.DEFAULT_TRANSCRIPTION_MODEL
-            )
+            "model": self.config.get("transcription_model", self.DEFAULT_TRANSCRIPTION_MODEL)
         }
 
         language = self.config.get("transcription_language")
@@ -157,356 +164,385 @@ class RealtimeVoiceClient:
                             "properties": {
                                 "query": {
                                     "type": "string",
-                                    "description": "The song name, artist, or search query to play"
+                                    "description": "The song name, artist, or search query to play",
                                 }
                             },
-                            "required": ["query"]
-                        }
+                            "required": ["query"],
+                        },
                     },
                     {
                         "type": "function",
                         "name": "pause_music",
                         "description": "Pause the currently playing music.",
-                        "parameters": {"type": "object", "properties": {}}
+                        "parameters": {"type": "object", "properties": {}},
                     },
                     {
                         "type": "function",
                         "name": "resume_music",
                         "description": "Resume paused music.",
-                        "parameters": {"type": "object", "properties": {}}
+                        "parameters": {"type": "object", "properties": {}},
                     },
                     {
                         "type": "function",
                         "name": "stop_music",
                         "description": "Stop the currently playing music completely.",
-                        "parameters": {"type": "object", "properties": {}}
+                        "parameters": {"type": "object", "properties": {}},
                     },
                     {
                         "type": "function",
                         "name": "get_music_status",
                         "description": "Get the current music playback status (what's playing, paused, etc.).",
-                        "parameters": {"type": "object", "properties": {}}
+                        "parameters": {"type": "object", "properties": {}},
                     },
                     {
                         "type": "function",
                         "name": "skip_song",
-                        "description": "Skip the current song.",
-                        "parameters": {"type": "object", "properties": {}}
-                    }
+                        "description": "Stop the current song. There is no queue; ask the user to choose another song.",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
                 ],
                 "audio": {
                     "input": {
-                        "format": {
-                            "type": "audio/pcm",
-                            "rate": 24000
-                        },
+                        "format": {"type": "audio/pcm", "rate": 24000},
                         "transcription": self._build_transcription_config(),
                         "turn_detection": {
                             "type": "server_vad",
                             "threshold": 0.5,
                             "prefix_padding_ms": 300,
-                            "silence_duration_ms": 500
-                        }
+                            "silence_duration_ms": 500,
+                        },
                     },
                     "output": {
-                        "format": {
-                            "type": "audio/pcm",
-                            "rate": 24000
-                        },
-                        "voice": self._get_realtime_voice()
-                    }
-                }
-            }
+                        "format": {"type": "audio/pcm", "rate": 24000},
+                        "voice": self._get_realtime_voice(),
+                    },
+                },
+            },
         }
-        
-    async def initialize(self):
-        """Initialize the realtime service connection"""
-        try:
-            # Connect to OpenAI Realtime API
-            headers = {
-                "Authorization": f"Bearer {self.api_key}"
-            }
-            
-            # Get model from config or use default
-            model = self._get_realtime_model()
-            
-            self.websocket = await websockets.connect(
-                f"wss://api.openai.com/v1/realtime?model={model}",
-                additional_headers=headers,
-                # Don't leave wake-word detection waiting through the default
-                # ten-second close handshake after music starts.
-                close_timeout=1,
-            )
-            
-            session_config = self._build_session_config()
-            
-            await self.websocket.send(json.dumps(session_config))
-            
-            self._log("REALTIME_INIT", "Realtime voice client initialized successfully")
-            
-        except Exception as e:
-            self._log("REALTIME_ERROR", f"Failed to initialize realtime client: {e}")
-            raise
-    
-    async def start_conversation(self):
-        """Start the realtime conversation"""
-        if not self.websocket:
-            await self.initialize()
-        
-        try:
-            # Pause music if playing to avoid audio conflicts
-            if self.music_handler:
-                music_status = self.music_handler.get_status()
-                if music_status.get('is_playing') and not music_status.get('is_paused'):
-                    await self.music_handler.pause_for_conversation()
-                    self._log("MUSIC_AUTO_PAUSE", "Automatically paused music for conversation")
-            
-            self.is_connected = True
-            self.conversation_should_end = False
-            self.last_activity_time = time.time()
-            self.last_user_activity_time = time.time()
-            self._consecutive_assistant_turns = 0
-            self._noise_transcript_count = 0
 
-            self._log("REALTIME_START", "Started realtime conversation")
-            
-            # Start audio input stream
+    async def _send(self, event: dict) -> None:
+        await self.websocket.send(json.dumps(event))
+
+    async def initialize(self) -> None:
+        self.websocket = await websockets.connect(
+            f"wss://api.openai.com/v1/realtime?model={quote(self._get_realtime_model(), safe='')}",
+            additional_headers={"Authorization": f"Bearer {self.api_key}"},
+            open_timeout=10,
+            close_timeout=1,
+        )
+        await self._send(self._build_session_config())
+        # Do not open the microphone until the server accepts this configuration.
+        async with asyncio.timeout(10):
+            while True:
+                event = json.loads(await self.websocket.recv())
+                if event.get("type") == "error":
+                    raise RuntimeError(f"Realtime configuration rejected: {event.get('error')}")
+                if event.get("type") == "session.updated":
+                    break
+        self._log("REALTIME_INIT", "Realtime session configured")
+
+    async def start_conversation(self) -> None:
+        """Own every worker until completion, failure, timeout, or cancellation.
+
+        A worker ending unexpectedly ends the whole session; siblings are always
+        cancelled and awaited before their streams or socket are closed.
+        """
+        if self._closed:
+            raise RuntimeError("Realtime client is closed")
+        if self._conversation_task is not None:
+            raise RuntimeError("A conversation is already running")
+        self._conversation_task = asyncio.current_task()
+        self._stop_event.clear()
+        self._resume_music = True
+        self.conversation_should_end = False
+        self._reset_turn_state()
+        tasks = []
+        try:
+            await self.music_handler.pause_for_conversation()
+            await self.initialize()
+            self._init_audio()
             self.stream = self.audio.open(
                 format=pyaudio.paInt16,
                 channels=1,
-                rate=24000,
+                rate=SAMPLE_RATE,
                 input=True,
-                frames_per_buffer=1024
+                frames_per_buffer=INPUT_FRAMES,
             )
-            
-            # Start listening tasks
-            listen_task = asyncio.create_task(self._listen_for_audio())
-            response_task = asyncio.create_task(self._handle_responses())
-            silence_task = asyncio.create_task(self._monitor_silence())
-            
-            # Wait for tasks to complete
-            await asyncio.gather(listen_task, response_task, silence_task)
-            
-        except Exception as e:
-            self._log("REALTIME_ERROR", f"Error starting conversation: {e}")
-            raise
-    
-    async def _listen_for_audio(self):
-        """Listen for audio input and send to realtime API.
+            self.last_user_activity_time = time.monotonic()
+            self.is_connected = True
+            for worker in (
+                self._listen_for_audio(),
+                self._handle_responses(),
+                self._play_output(),
+                self._monitor_silence(),
+                self._stop_event.wait(),
+            ):
+                tasks.append(asyncio.create_task(worker))
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                task.result()
+        except ConnectionClosedOK:
+            self._log("REALTIME_STOP", "Server closed the conversation")
+        finally:
+            await complete_task(asyncio.create_task(self._finish_conversation(tasks)))
 
-        The mic stays active even while the assistant speaks, enabling
-        barge-in (interruption). The OpenAI Realtime API's built-in VAD
-        detects user speech during a response and truncates its output.
-        """
+    async def _finish_conversation(self, tasks: list[asyncio.Task]) -> None:
         try:
-            while self.is_connected and not self.conversation_should_end:
-                if not self.stream:
-                    await asyncio.sleep(0.01)
-                    continue
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            try:
+                await self._close_conversation()
+            finally:
+                self._conversation_task = None
 
-                # Read audio data
-                audio_data = self.stream.read(1024, exception_on_overflow=False)
-
-                # Check for audio activity
-                volume = self._calculate_rms(audio_data)
-
-                if volume > 100:  # Threshold for detecting speech
-                    self.last_activity_time = time.time()
-                    self.last_user_activity_time = time.time()
-
-                # Convert to base64 for transmission
-                audio_b64 = base64.b64encode(audio_data).decode('utf-8')
-                
-                # Send audio to API
-                audio_event = {
+    async def _listen_for_audio(self) -> None:
+        while not self.conversation_should_end:
+            pcm = await audio_operation(self.stream.read, INPUT_FRAMES, exception_on_overflow=False)
+            await self._send(
+                {
                     "type": "input_audio_buffer.append",
-                    "audio": audio_b64
+                    "audio": base64.b64encode(pcm).decode("ascii"),
                 }
-                
-                await self.websocket.send(json.dumps(audio_event))
-                
-                # Small delay to prevent overwhelming the API
-                await asyncio.sleep(0.01)
-                
-        except Exception as e:
-            self._log("REALTIME_ERROR", f"Error in audio listening: {e}")
+            )
 
-    @staticmethod
-    def _calculate_rms(audio_data: bytes) -> float:
-        """Calculate PCM16 RMS without overflowing the input data type."""
-        samples = np.frombuffer(audio_data, dtype=np.int16)
-        if samples.size == 0:
-            return 0.0
+    async def _handle_responses(self) -> None:
+        while not self.conversation_should_end:
+            event = json.loads(await self.websocket.recv())
+            await self._handle_event(event)
 
-        float_samples = samples.astype(np.float32)
-        return float(np.sqrt(np.mean(np.square(float_samples))))
-    
-    async def _handle_responses(self):
-        """Handle responses from the realtime API"""
+    async def _handle_event(self, event: dict) -> None:
+        kind = event.get("type")
+        if kind == "conversation.item.input_audio_transcription.completed":
+            transcript = event.get("transcript", "")
+            if transcript:
+                self._log("USER_TRANSCRIPT", transcript)
+                if self._should_end_conversation(transcript):
+                    self._request_end()
+        elif kind == "input_audio_buffer.speech_started":
+            self._user_speaking = True
+            self.last_user_activity_time = time.monotonic()
+            await self._interrupt_output()
+        elif kind == "input_audio_buffer.speech_stopped":
+            self._user_speaking = False
+            self.last_user_activity_time = time.monotonic()
+        elif kind == "response.created":
+            self._response_in_progress = True
+        elif kind == "response.output_audio.delta":
+            pcm = base64.b64decode(event["delta"], validate=True)
+            if len(pcm) % 2:
+                raise ValueError("Realtime returned incomplete PCM16 audio")
+            for offset in range(0, len(pcm), OUTPUT_FRAMES * 2):
+                # Fail explicitly on excessive buffering instead of blocking the
+                # receive loop and preventing it from processing interruptions.
+                self._output_queue.put_nowait(
+                    (
+                        self._output_epoch,
+                        event["item_id"],
+                        event.get("content_index", 0),
+                        pcm[offset : offset + OUTPUT_FRAMES * 2],
+                    )
+                )
+        elif kind in {"response.output_audio_transcript.delta", "response.output_text.delta"}:
+            text = event.get("delta", "")
+            if text:
+                if not self._assistant_text_buffer:
+                    print("Assistant: ", end="", flush=True)
+                self._assistant_text_buffer += text
+                print(text, end="", flush=True)
+        elif kind == "response.done":
+            await self._finish_response(event.get("response", {}))
+        elif kind == "error":
+            raise RuntimeError(f"Realtime API error: {event.get('error')}")
+
+    async def _finish_response(self, response: dict) -> None:
+        self._response_in_progress = False
+        status = response.get("status")
+        text, self._assistant_text_buffer = self._assistant_text_buffer, ""
+        if text:
+            print()
+            self._log("ASSISTANT_RESPONSE", text)
+        if status == "failed":
+            raise RuntimeError(f"Realtime response failed: {response.get('status_details')}")
+        if status == "cancelled":
+            await self._interrupt_output()
+            return
+        self._assistant_finished_time = time.monotonic()
+        calls = [item for item in response.get("output", []) if item.get("type") == "function_call"]
+        # Execute completed calls once, after response.done. This also prevents a
+        # follow-up response.create from racing the preceding tool response.
+        started_music = False
+        self._tool_in_progress = bool(calls)
         try:
-            while self.is_connected and self.websocket and not self.conversation_should_end:
-                # Receive message from API
-                message = await self.websocket.recv()
-                event = json.loads(message)
-                
-                event_type = event.get("type")
-                
-                if event_type == "conversation.item.input_audio_transcription.completed":
-                    # Handle transcription of user input
-                    transcript = event.get("transcript", "")
-                    if transcript:
-                        self._log("USER_TRANSCRIPT", transcript)
-
-                        # Detect background noise (kids, TV, etc.)
-                        if self._is_noise_transcript(transcript):
-                            self._noise_transcript_count += 1
-                            self._log("NOISE_DETECTED",
-                                      f"Noise transcript #{self._noise_transcript_count}: '{transcript}'")
-                            if self._noise_transcript_count >= 2:
-                                self._log("CONVERSATION_END_DETECTED",
-                                          f"Noisy environment: {self._noise_transcript_count} noise transcripts")
-                                print("\n[Noisy environment detected, ending conversation...]")
-                                self.conversation_should_end = True
-                                await self.stop_conversation()
-                                return
-                            # Don't reset consecutive turn counter for noise
-                        else:
-                            # Real speech — reset noise and consecutive counters
-                            self._noise_transcript_count = 0
-                            self._consecutive_assistant_turns = 0
-
-                            # Check if user wants to end conversation
-                            if self._should_end_conversation(transcript):
-                                print("\n[Ending conversation...]")
-                                self.conversation_should_end = True
-                                await self.stop_conversation()
-                                return
-                
-                elif event_type == "response.output_audio.delta":
-                    # Handle audio response
-                    audio_data = event.get("delta")
-                    if audio_data:
-                        # Mark assistant as speaking to prevent input feedback
-                        self.is_assistant_speaking = True
-
-                        # Decode and play audio
-                        audio_bytes = base64.b64decode(audio_data)
-                        self._play_audio(audio_bytes)
-                
-                elif event_type == "response.output_audio_transcript.delta":
-                    # Handle assistant transcript when output modality is audio
-                    text = event.get("delta")
-                    if text:
-                        self.is_assistant_speaking = True
-                        if not self._assistant_text_buffer:
-                            print("Assistant: ", end="", flush=True)
-                        self._assistant_text_buffer += text
-                        print(text, end="", flush=True)
-
-                elif event_type == "response.output_text.delta":
-                    # Handle text-only response fallback
-                    text = event.get("delta")
-                    if text:
-                        self.is_assistant_speaking = True
-                        if not self._assistant_text_buffer:
-                            print("Assistant: ", end="", flush=True)
-                        self._assistant_text_buffer += text
-                        print(text, end="", flush=True)
-
-                elif event_type == "response.done":
-                    response = event.get("response", {})
-                    status = response.get("status")
-                    status_details = response.get("status_details") or {}
-
-                    if status == "failed":
-                        error = status_details.get("error") or {}
-                        message = error.get("message", "Realtime response failed.")
-                        self._log("REALTIME_ERROR", f"Response failed: {error}")
-                        print(f"\n[Realtime API error: {message}]")
-                        self.conversation_should_end = True
-                        await self.stop_conversation()
-                        return
-
-                    if status == "cancelled":
-                        self._log("REALTIME_CANCELLED", f"Response cancelled: {status_details}")
-                        print("\n[Realtime response cancelled]")
-                        continue
-
-                    print()  # New line after response
-                    # Log the complete assistant response once
-                    if self._assistant_text_buffer:
-                        self._log("ASSISTANT_RESPONSE", self._assistant_text_buffer)
-                        self._assistant_text_buffer = ""
-                    self.is_assistant_speaking = False
-                    self._assistant_finished_time = time.time()
-
-                    # Track consecutive assistant turns without user input
-                    self._consecutive_assistant_turns += 1
-                    if self._consecutive_assistant_turns >= self._max_consecutive_turns:
-                        self._log("CONVERSATION_END_DETECTED",
-                                  f"Ending: {self._consecutive_assistant_turns} consecutive assistant turns without user input")
-                        print(f"\n[No user input after {self._consecutive_assistant_turns} responses, ending conversation...]")
-                        self.conversation_should_end = True
-                        await self.stop_conversation()
-                        return
-                    
-                elif event_type == "response.function_call_arguments.done":
-                    # LLM decided to call a music function
-                    call_id = event.get("call_id", "")
-                    fn_name = event.get("name", "")
-                    raw_args = event.get("arguments", "{}")
-                    try:
-                        fn_args = json.loads(raw_args)
-                    except json.JSONDecodeError:
-                        fn_args = {}
-
-                    self._log("FUNCTION_CALL", f"{fn_name}({fn_args})")
-
-                    # Execute via music handler
-                    result = await self.music_handler.execute(fn_name, fn_args)
-                    result_text = result.get("response", "Done.")
-                    print(f"\n[Function {fn_name}: {result_text}]")
-
-                    # Send function output back to the model
-                    func_output = {
+            for call in calls:
+                name = call.get("name", "")
+                try:
+                    arguments = json.loads(call.get("arguments", "{}"))
+                except (ValueError, TypeError):
+                    arguments = None
+                self._log("FUNCTION_CALL", f"{name}({arguments})")
+                result = await self.music_handler.execute(name, arguments)
+                started_music = result.get("success") and result.get("action") == "play"
+                # Apply the last control's result if a response contains several calls.
+                await self._send(
+                    {
                         "type": "conversation.item.create",
                         "item": {
                             "type": "function_call_output",
-                            "call_id": call_id,
-                            "output": json.dumps(result)
-                        }
+                            "call_id": call["call_id"],
+                            "output": json.dumps(result),
+                        },
                     }
-                    await self.websocket.send(json.dumps(func_output))
+                )
+        finally:
+            self._tool_in_progress = False
+        if started_music:
+            self._request_end()
+        elif calls:
+            await self._send({"type": "response.create"})
+            self._response_in_progress = True
 
-                    # If play succeeded, end conversation and return to wake word mode
-                    if result.get("action") == "play" and result.get("success"):
-                        print("[Music started - will return to wake word detection mode]")
-                        self.conversation_should_end = True
-                        await self.stop_conversation()
-                        return
-                    else:
-                        # Trigger model to respond to the user with the result
-                        await self.websocket.send(json.dumps({"type": "response.create"}))
+    async def _play_output(self) -> None:
+        while True:
+            epoch, item_id, content_index, pcm = await self._output_queue.get()
+            try:
+                if epoch != self._output_epoch:
+                    continue
+                self._output_idle.clear()
+                self.is_assistant_speaking = True
+                if self.output_stream is None:
+                    self.output_stream = self.audio.open(
+                        format=pyaudio.paInt16,
+                        channels=1,
+                        rate=SAMPLE_RATE,
+                        output=True,
+                        frames_per_buffer=OUTPUT_FRAMES,
+                    )
+                if self._played_item != item_id:
+                    self._played_item = item_id
+                    self._played_content_index = content_index
+                    self._played_bytes = 0
+                await audio_operation(self.output_stream.write, pcm)
+                self._played_bytes += len(pcm)
+                self._assistant_finished_time = time.monotonic()
+            finally:
+                self.is_assistant_speaking = False
+                self._output_idle.set()
+                self._output_queue.task_done()
 
-                elif event_type == "input_audio_buffer.speech_started":
-                    self.last_user_activity_time = time.time()
-                    # Only reset consecutive turn counter if we haven't been
-                    # seeing noise — otherwise let the limit kick in faster.
-                    if self._noise_transcript_count == 0:
-                        self._consecutive_assistant_turns = 0
+    async def _interrupt_output(self) -> None:
+        pending = self.is_assistant_speaking or not self._output_queue.empty()
+        self._output_epoch += 1
+        unheard = None
+        while not self._output_queue.empty():
+            chunk = self._output_queue.get_nowait()
+            if unheard is None:
+                unheard = chunk
+            self._output_queue.task_done()
+        await self._output_idle.wait()
+        if pending:
+            close_stream(self.output_stream)
+            self.output_stream = None
+            # A response can be interrupted before its first queued chunk plays.
+            # In that case remove it at zero, rather than truncating an older item.
+            if unheard is not None and unheard[1] != self._played_item:
+                self._played_item, self._played_content_index = unheard[1:3]
+                self._played_bytes = 0
+            await self._send(
+                {
+                    "type": "conversation.item.truncate",
+                    "item_id": self._played_item,
+                    "content_index": self._played_content_index,
+                    "audio_end_ms": self._played_bytes * 1000 // (SAMPLE_RATE * 2),
+                }
+            )
+            self._log("BARGE_IN", "Discarded unplayed assistant audio")
+        self._played_item = None
 
-                    # If assistant was mid-response, this is a barge-in
-                    if self.is_assistant_speaking:
-                        self.is_assistant_speaking = False
-                        self._log("BARGE_IN", "User interrupted assistant response")
+    async def _monitor_silence(self) -> None:
+        while not self.conversation_should_end:
+            await asyncio.sleep(0.1)
+            if (
+                self._user_speaking
+                or self._response_in_progress
+                or self._tool_in_progress
+                or self.is_assistant_speaking
+                or not self._output_queue.empty()
+            ):
+                continue
+            reference = self.last_user_activity_time
+            timeout = self.config.get("silence_timeout", 8)
+            if self._assistant_finished_time and self._assistant_finished_time > reference:
+                reference = self._assistant_finished_time
+                timeout = self.config.get("post_response_timeout", 6)
+            if time.monotonic() - reference > timeout:
+                self._request_end()
 
-                elif event_type == "error":
-                    error = event.get("error", {})
-                    self._log("REALTIME_ERROR", f"API Error: {error}")
-                
-        except Exception as e:
-            self._log("REALTIME_ERROR", f"Error handling responses: {e}")
-    
+    def request_stop(self, *, resume_music: bool = True) -> None:
+        """Signal-safe on the event loop; also works during connection setup."""
+        self._resume_music = resume_music
+        self._request_end()
+
+    def _request_end(self) -> None:
+        self.conversation_should_end = True
+        self._stop_event.set()
+
+    async def send_text(self, text: str) -> None:
+        if self.is_connected:
+            await self._send(
+                {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": text}],
+                    },
+                }
+            )
+            await self._send({"type": "response.create"})
+
+    async def _close_conversation(self) -> None:
+        self.is_connected = False
+        self.conversation_should_end = True
+        self.is_assistant_speaking = False
+        close_stream(self.stream)
+        close_stream(self.output_stream)
+        self.stream = self.output_stream = None
+        socket, self.websocket = self.websocket, None
+        try:
+            if socket is not None:
+                await socket.close()
+        finally:
+            if self._resume_music:
+                await self.music_handler.resume_after_conversation()
+        self._log("REALTIME_STOP", "Stopped realtime conversation")
+
+    async def stop_conversation(self, *, resume_music: bool = True) -> None:
+        self.request_stop(resume_music=resume_music)
+        owner = self._conversation_task
+        if owner is not None and owner is not asyncio.current_task():
+            owner.cancel()
+            try:
+                await owner
+            except asyncio.CancelledError:
+                pass
+        elif owner is None:
+            await self._close_conversation()
+
+    async def cleanup(self) -> None:
+        try:
+            await self.stop_conversation(resume_music=False)
+        finally:
+            self._closed = True
+            audio, self.audio = self.audio, None
+            try:
+                if audio is not None:
+                    audio.terminate()
+            finally:
+                if self._owns_music:
+                    self.music_handler.cleanup()
+
     def _should_end_conversation(self, text: str) -> bool:
         """End on standalone farewells, not words embedded in music commands."""
         cleaned = re.sub(r"[^\w\s']", " ", text.casefold().replace("’", "'"))
@@ -523,224 +559,3 @@ class RealtimeVoiceClient:
 
         self._log("CONVERSATION_END_DETECTED", f"Standalone end phrase detected: '{text}'")
         return True
-
-    def _is_noise_transcript(self, text: str) -> bool:
-        """Check if transcript is background noise rather than intentional speech.
-
-        In noisy environments (house with kids, TV, etc.) the mic picks up
-        ambient sounds that get transcribed as short incoherent fragments.
-        Detecting these lets us bail out quickly instead of trying to respond.
-        """
-        cleaned = ''.join(c for c in text.lower() if c.isalnum() or c.isspace()).strip()
-        words = cleaned.split()
-
-        if not words:
-            return True
-
-        # Single-word transcripts that are common noise artifacts
-        single_word_noise = {
-            "hmm", "mm", "uh", "um", "ah", "oh", "huh",
-            "ha", "haha", "la", "da", "na", "ba", "bah",
-            "the", "a", "and", "but", "or", "is", "it",
-            "you", "i", "so", "to", "do", "if", "in",
-        }
-        if len(words) == 1 and words[0] in single_word_noise:
-            return True
-
-        # All words identical (e.g. "uh uh uh", "the the the")
-        if len(words) >= 2 and len(set(words)) == 1:
-            return True
-
-        # Short transcript made entirely of common filler / function words
-        filler_words = single_word_noise | {
-            "yeah", "yep", "no", "okay", "ok", "hey", "like", "just",
-            "what", "that", "this", "right", "we", "they", "he", "she",
-            "me", "my", "can", "not", "on", "of", "at", "for",
-            "up", "with", "are", "was", "be", "have", "has",
-            "go", "get", "got", "let", "see", "come", "here", "there",
-        }
-        if len(words) <= 3 and all(w in filler_words for w in words):
-            return True
-
-        return False
-    
-    async def _monitor_silence(self):
-        """Monitor for prolonged silence and end conversation.
-
-        Tracks user activity (not assistant speech) to decide when a
-        conversation is over. After the assistant finishes a response,
-        a shorter timeout applies — if the user doesn't speak within
-        that window, the conversation ends. The user can always start
-        a new conversation by saying the wake word.
-        """
-        try:
-            base_timeout = self.config.get("silence_timeout", 8)
-            post_response_timeout = self.config.get("post_response_timeout", 6)
-
-            while self.is_connected and not self.conversation_should_end:
-                now = time.time()
-
-                # Never time out while the assistant is still speaking
-                if self.is_assistant_speaking:
-                    await asyncio.sleep(1)
-                    continue
-
-                # After assistant finishes, measure silence from when it
-                # finished (not from when the user last spoke), so a long
-                # assistant answer doesn't cause an immediate timeout.
-                if (self._assistant_finished_time
-                        and self._assistant_finished_time > (self.last_user_activity_time or 0)):
-                    ref_time = self._assistant_finished_time
-                    effective_timeout = post_response_timeout
-                else:
-                    ref_time = self.last_user_activity_time or self.last_activity_time
-                    effective_timeout = base_timeout
-
-                if ref_time:
-                    silence = now - ref_time
-                    if silence > effective_timeout:
-                        print(f"\n[No user activity for {effective_timeout:.0f}s, ending conversation...]")
-                        self.conversation_should_end = True
-                        await self.stop_conversation()
-                        return
-
-                await asyncio.sleep(1)
-
-        except Exception as e:
-            self._log("REALTIME_ERROR", f"Error monitoring silence: {e}")
-    
-    def _play_audio(self, audio_data: bytes):
-        """Play audio data through speakers"""
-        try:
-            # Create output stream if needed
-            if not hasattr(self, 'output_stream') or not self.output_stream:
-                self.output_stream = self.audio.open(
-                    format=pyaudio.paInt16,
-                    channels=1,
-                    rate=24000,
-                    output=True
-                )
-            
-            # Play the audio
-            self.output_stream.write(audio_data)
-            
-        except Exception as e:
-            self._log("REALTIME_ERROR", f"Error playing audio: {e}")
-    
-    async def send_text(self, text: str):
-        """Send text message to start conversation"""
-        if not self.is_connected or not self.websocket:
-            return
-        
-        try:
-            # Create conversation item
-            conversation_item = {
-                "type": "conversation.item.create",
-                "item": {
-                    "type": "message",
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": text
-                        }
-                    ]
-                }
-            }
-            
-            await self.websocket.send(json.dumps(conversation_item))
-            
-            # Trigger response
-            response_create = {
-                "type": "response.create"
-            }
-            
-            await self.websocket.send(json.dumps(response_create))
-            
-            self._log("REALTIME_TEXT", f"Sent text: {text}")
-            
-        except Exception as e:
-            self._log("REALTIME_ERROR", f"Error sending text: {e}")
-    
-    async def stop_conversation(self):
-        """Stop the realtime conversation"""
-        self.is_connected = False
-        self.conversation_should_end = True
-        self.is_assistant_speaking = False
-
-        if self.stream:
-            self.stream.stop_stream()
-            self.stream.close()
-            self.stream = None
-
-        if hasattr(self, 'output_stream') and self.output_stream:
-            self.output_stream.stop_stream()
-            self.output_stream.close()
-            self.output_stream = None
-        
-        if self.websocket:
-            websocket, self.websocket = self.websocket, None
-            await websocket.close()
-        
-        # Resume music if it was paused for conversation
-        if self.music_handler:
-            try:
-                resumed = await self.music_handler.resume_after_conversation()
-                if resumed:
-                    self._log("MUSIC_AUTO_RESUME", "Automatically resumed music after conversation")
-            except Exception as e:
-                self._log("MUSIC_ERROR", f"Error resuming music after conversation: {e}")
-        
-        self._log("REALTIME_STOP", "Stopped realtime conversation")
-    
-    def cleanup(self):
-        """Clean up resources"""
-        try:
-            # Stop conversation synchronously
-            if self.is_connected:
-                self.is_connected = False
-                self.is_assistant_speaking = False
-
-                # Close audio streams
-                if self.stream:
-                    try:
-                        self.stream.stop_stream()
-                        self.stream.close()
-                        self.stream = None
-                    except Exception as e:
-                        self._log("REALTIME_ERROR", f"Error closing input stream: {e}")
-
-                if hasattr(self, 'output_stream') and self.output_stream:
-                    try:
-                        self.output_stream.stop_stream()
-                        self.output_stream.close()
-                        self.output_stream = None
-                    except Exception as e:
-                        self._log("REALTIME_ERROR", f"Error closing output stream: {e}")
-                
-                # Close websocket connection
-                if self.websocket:
-                    try:
-                        # Close websocket synchronously if possible
-                        import asyncio
-                        loop = asyncio.get_event_loop()
-                        if loop.is_running():
-                            # Schedule close for later if loop is running
-                            asyncio.create_task(self.websocket.close())
-                        self.websocket = None
-                    except Exception as e:
-                        self._log("REALTIME_ERROR", f"Error closing websocket: {e}")
-            
-            # Cleanup music handler
-            if hasattr(self, 'music_handler'):
-                self.music_handler.cleanup()
-            
-            # Terminate PyAudio
-            if self.audio:
-                try:
-                    self.audio.terminate()
-                except Exception as e:
-                    self._log("REALTIME_ERROR", f"Error terminating PyAudio: {e}")
-                    
-        except Exception as e:
-            print(f"Error during realtime client cleanup: {e}")

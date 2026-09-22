@@ -12,8 +12,7 @@ import requests
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MODEL_NAME = "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01"
 MODEL_URL = (
-    "https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/"
-    f"{MODEL_NAME}.tar.bz2"
+    f"https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/{MODEL_NAME}.tar.bz2"
 )
 MODEL_SHA256 = "f170013b4716e41b62b9bfd809687c207cef798ef9bc6534d524e17af9b6561a"
 DEFAULT_MODEL_DIR = PROJECT_ROOT / "models" / MODEL_NAME
@@ -37,8 +36,8 @@ def ensure_wake_word_model(model_dir: Path = DEFAULT_MODEL_DIR) -> dict[str, Pat
         return paths
 
     logging.getLogger(__name__).info("Downloading wake-word model from %s", MODEL_URL)
-    model_dir.parent.mkdir(parents=True, exist_ok=True)
     try:
+        model_dir.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix=".wake-model-", dir=model_dir.parent) as tmp:
             staging = Path(tmp)
             archive = staging / "model.tar.bz2"

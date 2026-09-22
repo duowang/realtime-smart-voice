@@ -1,232 +1,32 @@
-# CLAUDE.md
+# Development notes
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Follow [AGENTS.md](AGENTS.md) for repository conventions and [README.md](README.md) for setup and configuration. Python 3.12 is required.
 
-## Project Overview
+## Architecture
 
-This is a real-time smart voice assistant that combines:
-- **sherpa-onnx** for wake word detection (offline, real-time)
-- **OpenAI Realtime API** (GA) for natural voice conversations via direct WebSocket
-- **Asynchronous Architecture** for responsive, non-blocking audio processing
+- `realtime_voice_assistant.py` owns the shared music handler, wake detector, Realtime client, logging handler, and signal handlers. Wake detection and conversation alternate because they use different microphone sample rates.
+- `wake_word_detector.py` feeds 16 kHz PCM16 into the pinned English sherpa-onnx model. Its SentencePiece tokenizer must match the model. `wake_word_model.py` verifies the downloaded archive before publishing allowlisted regular files.
+- `realtime_voice_client.py` uses the GA OpenAI Realtime WebSocket protocol and 24 kHz mono PCM16. It waits for session configuration acknowledgement before opening the microphone. Each conversation owns and awaits its input, event receiver, playback, silence monitor, and stop tasks.
+- `audio_io.py` runs short blocking device reads/writes in worker threads. Cancellation waits for the in-flight operation before closing its stream. Speaker output is queued in 20 ms chunks; interruption drops queued chunks and sends `conversation.item.truncate`.
+- `music_commands.py` validates tool arguments and returns structured results. Calls execute from `response.done`, once all arguments are complete. A successful play returns to wake detection without asking the model to speak over music.
+- `youtube_music_player.py` controls pygame's existing playback engine. There is no extra Python playback thread or playlist queue. Paused tracks remain loaded. Explicit pause clears the conversation auto-resume flag; stop invalidates pending search/download results.
+- `album_art.py` handles thumbnail download, image validation, and optional iTerm2/tmux or ANSI display. Redirected output skips images.
+- `configuration.py` centralizes paths, timeout validation, and dotenv parsing. Shell environment takes precedence over `.env`, then the optional JSON API key.
 
-## Key Features
+## Validation
 
-This project provides a modern real-time voice assistant with:
-- **Real-time Processing**: Uses OpenAI Realtime API for immediate voice interactions
-- **Streaming Audio**: Continuous bidirectional audio streams for natural conversation
-- **Low Latency**: Real-time conversation without delays of traditional STT→LLM→TTS pipelines
-- **Music Playback**: YouTube Music integration with voice commands (play, pause, resume, skip)
-- **Album Art Display**: Song thumbnails rendered in terminal using ANSI true-color half-block characters
-- **Asynchronous**: Non-blocking architecture using asyncio throughout
+Run `make dev-deps` once, then `make check` for compilation, Ruff (including tests and the audio generator), and offline pytest checks. Use `bash -n run.sh` after runner changes. CI runs these on Linux; never require credentials or physical audio devices in unit tests.
 
-## Development Commands
+For live integration, follow the headless command in README. It uses the real keyword model, OpenAI, YouTube Music, and SDL's silent mixer, with prerecorded audio replacing PortAudio devices. Keep personal recordings, reports, cache, logs, and keys out of Git. Do not equate digital audio tests with room-acoustic validation.
 
-### Environment Setup
-```bash
-# Install system dependencies (Linux/Raspberry Pi)
-sudo apt install -y portaudio19-dev python3-pyaudio python3-pip python3-venv
+## Invariants to preserve
 
-# Create and activate virtual environment
-python3.12 -m venv venv
-source venv/bin/activate
-
-# Install Python dependencies
-pip install -r requirements.txt
-```
-
-### Running the Application
-```bash
-# Main way to run (with environment setup and validation)
-./run.sh
-
-# Direct execution
-cd src && python realtime_voice_assistant.py
-
-# With custom config
-./run.sh --config /path/to/config.json
-```
-
-### Testing Components
-```bash
-# Test wake word detection only
-cd src && python -c "import asyncio; from wake_word_detector import WakeWordDetector; asyncio.run(WakeWordDetector({}).listen_for_wake_word())"
-
-# Test audio devices
-python -c "import pyaudio; p = pyaudio.PyAudio(); [print(f'{i}: {p.get_device_info_by_index(i)}') for i in range(p.get_device_count())]"
-
-# Test microphone
-arecord -d 5 test.wav && aplay test.wav
-```
-
-## Architecture Overview
-
-### Core Components
-
-1. **RealtimeVoiceAssistant** (`realtime_voice_assistant.py`) - Main orchestrator
-   - Manages the complete application lifecycle
-   - Coordinates wake word detection and real-time conversation
-   - Handles asynchronous event loop and signal management
-   - Provides comprehensive logging and error handling
-
-2. **WakeWordDetector** (`wake_word_detector.py`) - Wake word detection
-   - Offline sherpa-onnx keyword spotting (no vendor account or key)
-   - Configurable English phrases, default "Hi Taco", encoded using the model SentencePiece tokenizer
-   - PyAudio-based continuous audio monitoring
-   - Configurable detection threshold (`wake_word_threshold`, default 0.1)
-
-3. **RealtimeVoiceClient** (`realtime_voice_client.py`) - Real-time conversation
-   - Direct WebSocket connection to OpenAI Realtime API (GA)
-   - Real-time bidirectional audio streaming (PCM 24kHz)
-   - Server-side Voice Activity Detection (server_vad)
-   - Barge-in support (user can interrupt assistant)
-   - Music command detection and routing
-
-4. **MusicCommandHandler** (`music_commands.py`) - Music playback
-   - YouTube Music search and playback via yt-dlp
-   - Voice commands: play, pause, resume, stop, next, etc.
-   - Auto-pause during conversation, auto-resume after
-
-5. **YouTubeMusicPlayer** (`youtube_music_player.py`) - Audio player
-   - Direct yt-dlp download and pygame playback
-   - Queue management and playback controls
-   - Thumbnail download and caching (hi-res via Google CDN URL rewrite)
-   - Terminal album art rendering using ANSI true-color half-block characters
-   - Adaptive sizing based on terminal dimensions (50% of smaller axis)
-
-### Data Flow
-1. **Continuous Wake Word Monitoring**: Asynchronous audio monitoring for "Hi Taco"
-2. **Wake Word Detection**: sherpa-onnx processes 16 kHz PCM audio frames locally
-3. **Conversation Initialization**: WebSocket connection established to Realtime API
-4. **Real-time Audio Streaming**: Bidirectional audio with OpenAI Realtime API
-5. **Natural Conversation**: Low-latency back-and-forth interaction
-6. **Automatic Timeout**: Return to wake word detection after inactivity
-
-### Configuration System
-
-Main config: `config/config.json`
-- API key (OpenAI Realtime API)
-- Conversation timeout settings
-- Wake word configuration
-- Logging preferences
-
-Environment Variables (.env file):
-- `OPENAI_API_KEY` - Required for Realtime API access
-Runtime timeouts are configured in `config/config.json`: `conversation_timeout` (120 seconds), `silence_timeout` (8 seconds), and `post_response_timeout` (6 seconds). Logging uses INFO level.
-
-The project supports `.env` files for secure API key management with automatic loading via python-dotenv.
-
-### Custom Wake Word
-
-Uses a custom "Hi Taco" wake word:
-- Model: pinned English-only sherpa-onnx GigaSpeech Zipformer, downloaded with SHA-256 verification and cached under `models/`
-- Phrases: `wake_keywords` in config; English phrases use the bundled SentencePiece tokenizer
-- Configurable detection threshold (`wake_word_threshold`, default 0.1)
-- Asynchronous processing to avoid blocking
-
-### OpenAI Realtime API Integration
-
-This project uses OpenAI's Realtime API (GA, not beta):
-- **Endpoint**: `wss://api.openai.com/v1/realtime`
-- **Model**: `gpt-realtime-2.1` (configurable via `realtime_model` in config)
-- **Voice**: `marin` (configurable)
-- **Connection**: Direct WebSocket via `websockets` library (no Pipecat)
-- **Audio Format**: PCM 24kHz, mono, 16-bit
-- **VAD**: Server-side voice activity detection (`server_vad`)
-- **Transcription**: `gpt-4o-mini-transcribe` for input audio transcription
-- **Session Config**: Uses GA API format with nested `audio.input`/`audio.output` objects
-
-### Asynchronous Architecture
-
-Built entirely on asyncio for maximum responsiveness:
-- **Non-blocking Audio**: Continuous wake word monitoring
-- **Concurrent Processing**: Wake word detection + real-time conversation
-- **Event-driven**: Signal handling and graceful shutdown
-- **Resource Management**: Proper cleanup and connection management
-
-## Important Implementation Details
-
-### Wake Word to Conversation Handoff
-- **Immediate Response**: Wake word detection stops monitoring
-- **Quick Initialization**: Realtime API connection established
-- **Seamless Transition**: Direct audio stream handoff
-- **Acknowledgment**: Audio confirmation of wake word detection
-
-### Real-time Audio Processing
-- **Streaming Input**: Continuous audio capture during conversation
-- **VAD Integration**: Smart silence detection and audio quality
-- **Low Latency**: Direct audio streaming to/from OpenAI
-- **Format Handling**: Proper audio format conversion and management
-
-### Error Resilience and Logging
-- **Comprehensive Logging**: All events logged to `logs/realtime_voice_assistant.log`
-- **Error Recovery**: Graceful handling of API failures
-- **Connection Management**: Automatic reconnection and cleanup
-- **Resource Cleanup**: Proper disposal of audio resources and connections
-
-### Performance Optimizations
-- **Minimal Buffer Delays**: Real-time audio processing
-- **Efficient Memory Usage**: Streaming instead of buffering large audio
-- **Fast Wake Word Detection**: Small quantized sherpa-onnx model on one CPU thread
-- **Async Everywhere**: Non-blocking operations throughout
-
-## Development Guidelines
-
-### Testing Real-time Components
-When working with real-time audio:
-1. Test on actual hardware (Raspberry Pi preferred)
-2. Verify API access to OpenAI Realtime API
-3. Test with various acoustic environments
-4. Monitor latency and responsiveness
-5. Validate conversation flow and timeout handling
-
-### API Requirements
-OpenAI Realtime API considerations:
-- **GA Access**: Uses the generally available Realtime API (not beta)
-- **Model**: `gpt-realtime-2.1` (configurable)
-- **Rate Limits**: Monitor API usage and implement backoff if needed
-- **Connection Management**: Handle WebSocket connections properly
-
-### Asynchronous Programming
-Maintain async/await throughout:
-- All audio operations should be non-blocking
-- Use proper asyncio patterns for concurrent operations
-- Handle cancellation and cleanup properly
-- Avoid blocking calls in async contexts
-
-### Configuration and Environment
-- API keys can be in config file or environment variables
-- Validate all required keys and files at startup
-- Provide clear error messages for missing requirements
-- Support both development and production configurations
-
-## Dependencies and Requirements
-
-### Python Packages
-- `openai>=1.3.0`: OpenAI API client
-- `websockets>=12.0`: WebSocket connection to Realtime API
-- `sherpa-onnx>=1.13.8,<2.0.0`: Offline wake word detection
-- `sentencepiece>=0.2.0,<0.3.0`: Matching English wake-word tokenizer
-- `pyaudio>=0.2.11`: Audio input/output
-- `numpy>=1.24.0`: Audio processing
-- `soundfile>=0.12.1`: Audio file reading
-- `python-dotenv>=1.0.0`: Environment variable management
-- `ytmusicapi>=1.3.0`: YouTube Music search
-- `yt-dlp>=2024.1.0`: YouTube audio download
-- `pygame>=2.5.0`: Music playback
-- `requests>=2.31.0`: HTTP requests
-- `Pillow>=10.0.0`: Thumbnail image processing and terminal rendering
-
-### System Requirements
-- Python 3.12
-- PortAudio development libraries
-- Working microphone and audio output
-- Internet connection for API access
-- OpenAI API key with Realtime API access
-
-### Hardware Recommendations
-- Raspberry Pi 4/5 or modern Linux/macOS system
-- USB microphone or quality built-in mic
-- Good speakers or headphones for clear audio
-- Stable internet connection for real-time API calls
-
-This architecture provides a modern, responsive voice assistant with natural conversation capabilities through OpenAI's cutting-edge Realtime API.
+- Cancel and await conversation workers before closing audio devices or sockets.
+- The assistant owns shared music cleanup; a Realtime client only cleans a player it created itself.
+- Shutdown must not resume conversation-paused music.
+- An explicit pause persists across subsequent conversations.
+- Pygame reports `get_busy() == False` while paused; this does not mean the track ended.
+- Never report play success until mixer load/play succeeds, or start a stale download after stop.
+- Keep network and audio failures visible, and let the outer loop recover to wake detection after a failed conversation.
+- The conversation timeout must cover the active work, including connection setup and tools.
+- There is no acoustic echo cancellation. Loud music can mask the wake word.

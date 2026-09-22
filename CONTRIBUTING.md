@@ -49,7 +49,10 @@ Thank you for your interest in contributing! This project welcomes contributions
 - Keep functions focused and modular
 
 ### Testing
-- Run `make check` for compilation, Ruff linting, and the pytest suite
+- Run `make check` for compilation, Ruff linting of source/tests/tools, and the offline pytest suite
+- CI runs these checks on Python 3.12 without API keys, downloads, or audio devices
+- Use scoped mocks; never replace modules globally during test collection
+- Run the optional headless integration flow from README after conversation or music lifecycle changes
 - Test your changes thoroughly on your local setup
 - Ensure wake word detection still works
 - Verify real-time conversation functionality

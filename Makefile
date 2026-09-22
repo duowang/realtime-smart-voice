@@ -10,10 +10,10 @@ dev-deps:
 	. venv/bin/activate && python -m pip install -r requirements-dev.txt
 
 lint:
-	. venv/bin/activate && ruff check src
+	. venv/bin/activate && ruff check src tests generate_audio.py
 
 test:
 	. venv/bin/activate && pytest
 
 check:
-	. venv/bin/activate && python -m compileall src && ruff check src && pytest
+	. venv/bin/activate && python -m compileall -q src tests generate_audio.py && ruff check src tests generate_audio.py && pytest

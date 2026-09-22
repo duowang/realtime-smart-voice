@@ -3,14 +3,15 @@
 import logging
 import re
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable, Optional
 
 import numpy as np
 import pyaudio
 import sentencepiece as spm
 import sherpa_onnx
 
+from audio_io import audio_operation, close_stream
 from wake_word_model import DEFAULT_MODEL_DIR, PROJECT_ROOT, ensure_wake_word_model
 
 SAMPLE_RATE = 16000
@@ -35,7 +36,9 @@ def encode_keywords(keywords: list[str], tokenizer_path: Path) -> tuple[str, dic
         phrase = " ".join(phrase.split())
         pieces = tokenizer.encode(phrase.upper(), out_type=str)
         if not pieces or "<unk>" in pieces:
-            raise ValueError(f"Cannot tokenize wake phrase '{phrase}'; choose another English phrase")
+            raise ValueError(
+                f"Cannot tokenize wake phrase '{phrase}'; choose another English phrase"
+            )
         label = f"wake_{index}"
         labels[label] = phrase
         encoded.append(f"{' '.join(pieces)} @{label}")
@@ -45,7 +48,7 @@ def encode_keywords(keywords: list[str], tokenizer_path: Path) -> tuple[str, dic
 class WakeWordDetector:
     """Keep the wake-word stream separate from the assistant's conversation audio."""
 
-    def __init__(self, config: dict, log_function: Optional[Callable] = None):
+    def __init__(self, config: dict, log_function: Callable | None = None):
         self.config = config
         self.log_function = log_function
         self.audio = None
@@ -61,7 +64,9 @@ class WakeWordDetector:
         if not model_dir.is_absolute():
             model_dir = PROJECT_ROOT / model_dir
         paths = ensure_wake_word_model(model_dir)
-        self._keywords, self._keyword_labels = encode_keywords(self.wake_keywords, paths["tokenizer"])
+        self._keywords, self._keyword_labels = encode_keywords(
+            self.wake_keywords, paths["tokenizer"]
+        )
         # sherpa reads this file during construction. A private temporary file
         # lets concurrent assistants use different phrases without overwriting one another.
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", encoding="utf-8") as keywords:
@@ -108,7 +113,7 @@ class WakeWordDetector:
         print(f"Started listening for wake word: {', '.join(self.wake_keywords)}")
         self._log("WAKE_WORD_START", "Started offline wake-word detection")
 
-    def process_audio(self, audio_frame: bytes) -> Optional[str]:
+    def process_audio(self, audio_frame: bytes) -> str | None:
         """Feed PCM16 microphone audio to sherpa as normalized float32 samples."""
         if self.keyword_stream is None:
             self.keyword_stream = self.spotter.create_stream()
@@ -122,10 +127,12 @@ class WakeWordDetector:
                 return self._keyword_labels[result]
         return None
 
-    async def listen_for_wake_word(self) -> Optional[str]:
+    async def listen_for_wake_word(self) -> str | None:
         if not self.is_listening:
             await self.start_listening()
-        audio_frame = self.stream.read(FRAME_LENGTH, exception_on_overflow=False)
+        audio_frame = await audio_operation(
+            self.stream.read, FRAME_LENGTH, exception_on_overflow=False
+        )
         keyword = self.process_audio(audio_frame)
         if keyword:
             self._log("WAKE_WORD_DETECTED", f"sherpa-onnx detected: '{keyword}'")
@@ -137,10 +144,7 @@ class WakeWordDetector:
         self.keyword_stream = None
         stream, self.stream = self.stream, None
         if stream is not None:
-            try:
-                stream.stop_stream()
-            finally:
-                stream.close()
+            close_stream(stream)
 
     async def stop_listening(self):
         self._close_stream()
@@ -153,7 +157,7 @@ class WakeWordDetector:
             self._close_stream()
         finally:
             if self.audio is not None:
-                self.audio.terminate()
-                self.audio = None
+                audio, self.audio = self.audio, None
+                audio.terminate()
             self.spotter = None
         self._log("WAKE_WORD_STOP", "Wake-word detector cleaned up")

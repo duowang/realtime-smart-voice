@@ -1,318 +1,101 @@
-#!/usr/bin/env python3
+"""Validate Realtime tool calls and translate player state into spoken results."""
 
-from typing import Callable, Optional
+import logging
 
 from youtube_music_player import YouTubeMusicPlayer
 
 
 class MusicCommandHandler:
-    """Handles music-related voice commands via LLM function calling"""
-
-    def __init__(self, log_function: Optional[Callable] = None, music_volume: Optional[float] = None):
+    def __init__(self, log_function=None, music_volume: float | None = None):
         self.log_function = log_function
         self.music_player = YouTubeMusicPlayer(log_function, volume=music_volume)
-    
-    def _log(self, log_type: str, message: str):
-        """Log message if logging function is available"""
+
+    def _log(self, kind: str, message: str) -> None:
         if self.log_function:
-            try:
-                self.log_function(log_type, message)
-            except Exception as e:
-                print(f"Error logging music command: {e}")
+            self.log_function(kind, message)
         else:
-            print(f"[{log_type}] {message}")
-    
+            logging.getLogger(__name__).info("[%s] %s", kind, message)
+
+    @staticmethod
+    def _result(success: bool, action: str, response: str, **details) -> dict:
+        return {"success": success, "action": action, "response": response, **details}
+
     async def execute(self, function_name: str, arguments: dict) -> dict:
-        """
-        Execute a music function by name.
-
-        Args:
-            function_name: One of play_music, pause_music, resume_music,
-                           stop_music, get_music_status, skip_song
-            arguments: Dict of arguments (e.g. {"query": "..."} for play_music)
-
-        Returns:
-            Dictionary with response information
-        """
-        self._log("MUSIC_FUNCTION_CALL", f"{function_name}({arguments})")
-
         handlers = {
-            "play_music": lambda: self._handle_play_command(arguments.get("query", "")),
-            "pause_music": lambda: self._handle_pause_command(),
-            "resume_music": lambda: self._handle_resume_command(),
-            "stop_music": lambda: self._handle_stop_command(),
-            "get_music_status": lambda: self._handle_status_command(),
-            "skip_song": lambda: self._handle_next_command(),
+            "play_music": self._play,
+            "pause_music": self._pause,
+            "resume_music": self._resume,
+            "stop_music": self._stop,
+            "get_music_status": self._status,
+            "skip_song": self._skip,
         }
-
         handler = handlers.get(function_name)
-        if not handler:
-            return {
-                "success": False,
-                "response": f"Unknown music function: {function_name}",
-                "action": "unknown",
-            }
+        if handler is None:
+            return self._result(False, "unknown", f"Unknown music function: {function_name}")
+        if not isinstance(arguments, dict):
+            return self._result(False, "invalid_arguments", "Music arguments must be an object.")
+        if function_name == "play_music":
+            query = arguments.get("query")
+            if not isinstance(query, str) or not query.strip():
+                return self._result(False, "invalid_arguments", "Please provide a song or artist.")
+            arguments = {"query": query.strip()}
+        self._log("MUSIC_FUNCTION_CALL", f"{function_name}({arguments})")
+        try:
+            return await handler(arguments)
+        except Exception as error:
+            self._log("MUSIC_ERROR", f"{function_name} failed: {error}")
+            return self._result(False, "error", "The music command failed. Please try again.")
 
-        try:
-            return await handler()
-        except Exception as e:
-            self._log("MUSIC_ERROR", f"Error executing {function_name}: {e}")
-            return {
-                "success": False,
-                "response": f"Error executing {function_name}: {e}",
-                "action": "error",
-            }
-    
-    async def _handle_play_command(self, query: str) -> dict:
-        """Handle play music command"""
-        try:
-            self._log("MUSIC_PLAY_CMD", f"Playing: {query}")
-            
-            # Search and play the first result
-            success = await self.music_player.play_search_result(query)
-            
-            if success:
-                return {
-                    'success': True,
-                    'response': f"Now playing {query} from YouTube Music.",
-                    'action': 'play',
-                    'query': query
-                }
-            else:
-                return {
-                    'success': False,
-                    'response': f"Sorry, I couldn't find or play '{query}' on YouTube Music. Please try a different song.",
-                    'action': 'play_failed',
-                    'query': query
-                }
-                
-        except Exception as e:
-            self._log("MUSIC_ERROR", f"Error in play command: {e}")
-            return {
-                'success': False,
-                'response': f"Sorry, I had trouble playing '{query}'. Please try again.",
-                'action': 'play_error',
-                'query': query
-            }
-    
-    async def _handle_pause_command(self) -> dict:
-        """Handle pause music command"""
-        try:
-            status = self.music_player.get_status()
-            
-            if not status['is_playing']:
-                return {
-                    'success': False,
-                    'response': "There's no music currently playing to pause.",
-                    'action': 'pause_no_music'
-                }
-            
-            # A wake word temporarily pauses playback. An explicit pause must
-            # still reach the player to cancel its pending automatic resume.
-            success = await self.music_player.pause()
-            
-            if success:
-                song_title = status['current_song'].get('title', 'Unknown') if status['current_song'] else 'the music'
-                return {
-                    'success': True,
-                    'response': f"Paused {song_title}.",
-                    'action': 'pause'
-                }
-            else:
-                return {
-                    'success': False,
-                    'response': "Sorry, I couldn't pause the music.",
-                    'action': 'pause_failed'
-                }
-                
-        except Exception as e:
-            self._log("MUSIC_ERROR", f"Error in pause command: {e}")
-            return {
-                'success': False,
-                'response': "Sorry, I had trouble pausing the music.",
-                'action': 'pause_error'
-            }
-    
-    async def _handle_resume_command(self) -> dict:
-        """Handle resume music command"""
-        try:
-            status = self.music_player.get_status()
-            
-            if not status['is_playing']:
-                return {
-                    'success': False,
-                    'response': "There's no music to resume. Try asking me to play a song.",
-                    'action': 'resume_no_music'
-                }
-            
-            if not status['is_paused']:
-                return {
-                    'success': False,
-                    'response': "The music is already playing.",
-                    'action': 'resume_not_paused'
-                }
-            
-            success = await self.music_player.resume()
-            
-            if success:
-                song_title = status['current_song'].get('title', 'Unknown') if status['current_song'] else 'the music'
-                return {
-                    'success': True,
-                    'response': f"Resumed {song_title}.",
-                    'action': 'resume'
-                }
-            else:
-                return {
-                    'success': False,
-                    'response': "Sorry, I couldn't resume the music.",
-                    'action': 'resume_failed'
-                }
-                
-        except Exception as e:
-            self._log("MUSIC_ERROR", f"Error in resume command: {e}")
-            return {
-                'success': False,
-                'response': "Sorry, I had trouble resuming the music.",
-                'action': 'resume_error'
-            }
-    
-    async def _handle_stop_command(self) -> dict:
-        """Handle stop music command"""
-        try:
-            status = self.music_player.get_status()
-            
-            if not status['is_playing']:
-                return {
-                    'success': False,
-                    'response': "There's no music currently playing to stop.",
-                    'action': 'stop_no_music'
-                }
-            
-            song_title = status['current_song'].get('title', 'Unknown') if status['current_song'] else 'the music'
-            success = await self.music_player.stop()
-            
-            if success:
-                return {
-                    'success': True,
-                    'response': f"Stopped {song_title}.",
-                    'action': 'stop'
-                }
-            else:
-                return {
-                    'success': False,
-                    'response': "Sorry, I couldn't stop the music.",
-                    'action': 'stop_failed'
-                }
-                
-        except Exception as e:
-            self._log("MUSIC_ERROR", f"Error in stop command: {e}")
-            return {
-                'success': False,
-                'response': "Sorry, I had trouble stopping the music.",
-                'action': 'stop_error'
-            }
-    
-    async def _handle_status_command(self) -> dict:
-        """Handle music status command"""
-        try:
-            status = self.music_player.get_status()
-            
-            if not status['is_playing']:
-                return {
-                    'success': True,
-                    'response': "No music is currently playing.",
-                    'action': 'status',
-                    'status': 'not_playing'
-                }
-            
-            current_song = status['current_song']
-            if current_song:
-                song_info = current_song.get('title', 'Unknown Song')
-                
-                if status['is_paused']:
-                    response = f"Currently paused: {song_info}"
-                    playback_status = 'paused'
-                else:
-                    response = f"Currently playing: {song_info}"
-                    playback_status = 'playing'
-                
-                return {
-                    'success': True,
-                    'response': response,
-                    'action': 'status',
-                    'status': playback_status,
-                    'song': song_info
-                }
-            else:
-                return {
-                    'success': True,
-                    'response': "Music is playing but I can't identify the current song.",
-                    'action': 'status',
-                    'status': 'playing_unknown'
-                }
-                
-        except Exception as e:
-            self._log("MUSIC_ERROR", f"Error in status command: {e}")
-            return {
-                'success': False,
-                'response': "Sorry, I couldn't get the music status.",
-                'action': 'status_error'
-            }
-    
-    async def _handle_next_command(self) -> dict:
-        """Handle next/skip command"""
-        try:
-            # For now, just stop current song (next song functionality would need playlist support)
-            status = self.music_player.get_status()
-            
-            if not status['is_playing']:
-                return {
-                    'success': False,
-                    'response': "No music is currently playing to skip.",
-                    'action': 'next_no_music'
-                }
-            
-            # Stop current song (placeholder for next functionality)
-            await self.music_player.stop()
-            
-            return {
-                'success': True,
-                'response': "Skipped. Ask me to play another song.",
-                'action': 'next'
-            }
-            
-        except Exception as e:
-            self._log("MUSIC_ERROR", f"Error in next command: {e}")
-            return {
-                'success': False,
-                'response': "Sorry, I had trouble skipping the song.",
-                'action': 'next_error'
-            }
-    
+    async def _play(self, arguments: dict) -> dict:
+        query = arguments["query"]
+        if not await self.music_player.play_search_result(query):
+            return self._result(
+                False, "play_failed", f"I couldn't find or play '{query}'.", query=query
+            )
+        status = self.get_status()
+        song = status["current_song"] or {}
+        return self._result(True, "play", f"Now playing {song.get('title', query)}.", query=query)
+
+    async def _pause(self, _) -> dict:
+        # Always reach pause even when wake-up already auto-paused this track:
+        # an explicit pause must clear the automatic-resume flag.
+        if await self.music_player.pause():
+            return self._result(True, "pause", "Music paused.")
+        return self._result(False, "pause_no_music", "There's no music playing to pause.")
+
+    async def _resume(self, _) -> dict:
+        if await self.music_player.resume():
+            return self._result(True, "resume", "Music resumed.")
+        if self.get_status()["is_playing"]:
+            return self._result(True, "resume", "The music is already playing.")
+        return self._result(False, "resume_no_music", "There's no music to resume.")
+
+    async def _stop(self, _) -> dict:
+        stopped = await self.music_player.stop()
+        return self._result(True, "stop", "Music stopped." if stopped else "No music is playing.")
+
+    async def _skip(self, _) -> dict:
+        await self.music_player.stop()
+        return self._result(True, "next", "Skipped. Ask me to play another song.")
+
+    async def _status(self, _) -> dict:
+        status = self.get_status()
+        if not status["is_playing"]:
+            return self._result(True, "status", "No music is playing.", status="not_playing")
+        state = "paused" if status["is_paused"] else "playing"
+        title = (status["current_song"] or {}).get("title", "Unknown song")
+        return self._result(
+            True, "status", f"Currently {state}: {title}.", status=state, song=title
+        )
+
     async def pause_for_conversation(self) -> bool:
-        """Pause music for conversation"""
-        try:
-            return await self.music_player.pause_for_conversation()
-        except Exception as e:
-            self._log("MUSIC_ERROR", f"Error pausing for conversation: {e}")
-            return False
-    
+        return await self.music_player.pause_for_conversation()
+
     async def resume_after_conversation(self) -> bool:
-        """Resume music after conversation"""
-        try:
-            return await self.music_player.resume_after_conversation()
-        except Exception as e:
-            self._log("MUSIC_ERROR", f"Error resuming after conversation: {e}")
-            return False
-    
+        return await self.music_player.resume_after_conversation()
+
     def get_status(self) -> dict:
-        """Get current music status"""
         return self.music_player.get_status()
-    
-    def cleanup(self):
-        """Clean up resources"""
-        try:
-            self.music_player.cleanup()
-            self._log("MUSIC_COMMANDS_CLEANUP", "Music command handler cleaned up")
-        except Exception as e:
-            self._log("MUSIC_ERROR", f"Error during cleanup: {e}")
+
+    def cleanup(self) -> None:
+        self.music_player.cleanup()

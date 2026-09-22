@@ -1,688 +1,366 @@
-#!/usr/bin/env python3
+"""Search, cache and control one YouTube Music track through pygame's mixer."""
 
 import asyncio
-import base64
 import hashlib
 import json
+import logging
 import os
 import re
-import subprocess
-import sys
+import tempfile
 import threading
 import time
 from datetime import datetime
-from typing import Callable, Optional
+from pathlib import Path
 
 import pygame
-import requests
 import yt_dlp
-from PIL import Image
 from ytmusicapi import YTMusic
+
+from album_art import AlbumArt
+from configuration import PROJECT_ROOT
+
+logger = logging.getLogger(__name__)
 
 
 class YouTubeMusicPlayer:
-    """YouTube Music player for voice assistant"""
+    """Pygame owns playback; all application state stays on the asyncio thread.
+
+    A generation invalidates pending downloads when stop or another play wins.
+    Worker threads only fetch files and never change playback state.
+    """
 
     DEFAULT_VOLUME = 0.35
-    
-    def __init__(self, log_function: Optional[Callable] = None, volume: Optional[float] = None):
-        """
-        Initialize YouTube Music player
-        
-        Args:
-            log_function: Optional logging function
-        """
+
+    def __init__(self, log_function=None, volume: float | None = None):
         self.log_function = log_function
         self.volume = float(self.DEFAULT_VOLUME if volume is None else volume)
         if not 0 <= self.volume <= 1:
             raise ValueError("music_volume must be between 0 and 1")
-        self._playback_lock = threading.Lock()
-        self.ytmusic = None
         self.current_song = None
         self.is_playing = False
         self.is_paused = False
-        self.was_paused_for_conversation = False  # Track if music was paused for conversation
-        self.playback_thread = None
-        self._tmux_passthrough = None
-        self._logged_tmux_passthrough_hint = False
-        
-        # Setup music cache directory
-        self.cache_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'music_cache')
-        self.metadata_file = os.path.join(self.cache_dir, 'metadata.json')
-        self._ensure_cache_directory()
-        
-        # Initialize pygame mixer
-        pygame.mixer.pre_init(frequency=44100, size=-16, channels=2, buffer=1024)
-        pygame.mixer.init()
-        
-        # Initialize YouTube Music API (no auth required for search)
-        try:
-            self.ytmusic = YTMusic()
-            self._log("MUSIC_INIT", "YouTube Music player initialized successfully")
-        except Exception as e:
-            self._log("MUSIC_ERROR", f"Failed to initialize YouTube Music API: {e}")
-            raise
-    
-    def _log(self, log_type: str, message: str):
-        """Log message if logging function is available"""
+        self.was_paused_for_conversation = False
+        self._generation = 0
+        self._closed = False
+        self.cache_dir = str(PROJECT_ROOT / "music_cache")
+        self.metadata_file = os.path.join(self.cache_dir, "metadata.json")
+        Path(self.cache_dir).mkdir(parents=True, exist_ok=True)
+        self.album_art = AlbumArt(Path(self.cache_dir), self._log)
+        self.ytmusic = YTMusic()
+        # Delay opening the output device until a track is actually requested.
+        self._log("MUSIC_INIT", "YouTube Music player ready")
+
+    def _log(self, kind: str, message: str) -> None:
         if self.log_function:
-            try:
-                self.log_function(log_type, message)
-            except Exception as e:
-                print(f"Error logging music event: {e}")
+            self.log_function(kind, message)
         else:
-            print(f"[{log_type}] {message}")
-    
-    def _ensure_cache_directory(self):
-        """Ensure cache directory exists"""
-        try:
-            os.makedirs(self.cache_dir, exist_ok=True)
-            self._log("CACHE_INIT", f"Cache directory ready: {self.cache_dir}")
-        except Exception as e:
-            self._log("CACHE_ERROR", f"Failed to create cache directory: {e}")
-    
+            logger.info("[%s] %s", kind, message)
+
+    def _refresh_playback(self) -> None:
+        # pygame reports not busy while paused, which is not the end of a song.
+        if self.is_playing and not self.is_paused:
+            if not pygame.mixer.get_init() or not pygame.mixer.music.get_busy():
+                self._clear_track()
+
+    def _clear_track(self) -> None:
+        self.is_playing = False
+        self.is_paused = False
+        self.was_paused_for_conversation = False
+        self.current_song = None
+
     def _generate_song_id(self, video_id: str, title: str, artist: str) -> str:
-        """Generate unique identifier for a song"""
-        # Create unique ID based on video_id, title, and artist
-        song_data = f"{video_id}_{title}_{artist}".lower()
-        return hashlib.md5(song_data.encode()).hexdigest()[:12]
-    
+        # Preserve existing cache filenames; this is an identifier, not a checksum.
+        value = f"{video_id}_{title}_{artist}".lower()
+        return hashlib.md5(value.encode(), usedforsecurity=False).hexdigest()[:12]
+
     def _get_cached_file_path(self, song_id: str) -> str:
-        """Get the file path for a cached song"""
         return os.path.join(self.cache_dir, f"{song_id}.mp3")
 
-    def _get_cached_thumbnail_path(self, song_id: str) -> str:
-        """Get the file path for a cached thumbnail"""
-        return os.path.join(self.cache_dir, f"{song_id}_thumb.jpg")
-    
     def _load_metadata(self) -> dict:
-        """Load metadata from cache"""
         try:
-            if os.path.exists(self.metadata_file):
-                with open(self.metadata_file, encoding='utf-8') as f:
-                    return json.load(f)
-        except Exception as e:
-            self._log("CACHE_ERROR", f"Error loading metadata: {e}")
-        return {}
-    
-    def _save_metadata(self, metadata: dict):
-        """Save metadata to cache"""
-        try:
-            with open(self.metadata_file, 'w', encoding='utf-8') as f:
-                json.dump(metadata, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            self._log("CACHE_ERROR", f"Error saving metadata: {e}")
-    
-    def _is_song_cached(self, song_id: str) -> bool:
-        """Check if song is already cached"""
-        cached_file = self._get_cached_file_path(song_id)
-        metadata = self._load_metadata()
-        
-        # Check if file exists and is in metadata
-        return (os.path.exists(cached_file) and 
-                song_id in metadata and 
-                os.path.getsize(cached_file) > 0)
-    
-    def _cache_song(self, song_id: str, video_id: str, title: str, artist: str, thumbnail_url: str = None):
-        """Add song to cache metadata"""
-        metadata = self._load_metadata()
-        current_time = datetime.now()
+            data = json.loads(Path(self.metadata_file).read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("Cache metadata must be an object")
+            return {
+                key: entry
+                for key, entry in data.items()
+                if re.fullmatch(r"[0-9a-f]{12}", key) and isinstance(entry, dict)
+            }
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as error:
+            self._log("CACHE_ERROR", f"Cannot read cache metadata: {error}")
+            return {}
 
-        entry = {
-            'video_id': video_id,
-            'title': title,
-            'artist': artist,
-            'cached_at': current_time.strftime('%Y-%m-%d %H:%M:%S'),
-            'cached_timestamp': time.time(),  # Keep numeric timestamp for sorting/calculations
-            'play_count': metadata.get(song_id, {}).get('play_count', 0) + 1,
-            'last_played': current_time.strftime('%Y-%m-%d %H:%M:%S')
-        }
+    def _save_metadata(self, metadata: dict) -> None:
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=self.cache_dir, suffix=".json", delete=False
+            ) as output:
+                temporary = Path(output.name)
+                json.dump(metadata, output, indent=2, ensure_ascii=False)
+                output.write("\n")
+            temporary.replace(self.metadata_file)
+        except OSError as error:
+            self._log("CACHE_ERROR", f"Cannot save cache metadata: {error}")
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+    def _cache_song(self, song_id, video_id, title, artist, thumbnail_url=None) -> None:
+        metadata = self._load_metadata()
+        entry = metadata.get(song_id, {})
+        now = datetime.now().isoformat(timespec="seconds")
+        count = entry.get("play_count", 0)
+        entry.update(
+            video_id=video_id,
+            title=title,
+            artist=artist,
+            last_played=now,
+            play_count=(count if isinstance(count, int) else 0) + 1,
+        )
+        entry.setdefault("cached_at", now)
+        entry.setdefault("cached_timestamp", time.time())
         if thumbnail_url:
-            entry['thumbnail_url'] = thumbnail_url
+            entry["thumbnail_url"] = thumbnail_url
         metadata[song_id] = entry
         self._save_metadata(metadata)
-    
+
     async def search_songs(self, query: str, limit: int = 5) -> list[dict]:
-        """
-        Search for songs on YouTube Music
-
-        Args:
-            query: Search query
-            limit: Maximum number of results
-
-        Returns:
-            List of song dictionaries
-        """
+        if not isinstance(query, str) or not query.strip() or limit < 1:
+            return []
         try:
             self._log("MUSIC_SEARCH", f"Searching for: {query}")
-
-            # Run sync ytmusic search in thread pool to avoid blocking event loop
-            loop = asyncio.get_event_loop()
-            search_results = await loop.run_in_executor(
-                None, lambda: self.ytmusic.search(query, filter='songs', limit=limit)
+            results = await asyncio.to_thread(
+                self.ytmusic.search, query, filter="songs", limit=limit
             )
-
             songs = []
-            for result in search_results:
-                song = {
-                    'videoId': result.get('videoId'),
-                    'title': result.get('title', 'Unknown Title'),
-                    'artist': ', '.join([artist['name'] for artist in result.get('artists', [])]) or 'Unknown Artist',
-                    'duration': result.get('duration', 'Unknown'),
-                    'thumbnail': self._get_hires_thumbnail_url(result.get('thumbnails', []))
-                }
-                songs.append(song)
-
-            self._log("MUSIC_SEARCH_RESULT", f"Found {len(songs)} songs for '{query}'")
+            for result in results:
+                video_id = result.get("videoId")
+                if not isinstance(video_id, str) or not re.fullmatch(
+                    r"[\w-]{11}", video_id, re.ASCII
+                ):
+                    continue
+                artists = result.get("artists") or []
+                songs.append(
+                    {
+                        "videoId": video_id,
+                        "title": result.get("title") or "Unknown Title",
+                        "artist": ", ".join(a["name"] for a in artists if a.get("name"))
+                        or "Unknown Artist",
+                        "duration": result.get("duration") or "Unknown",
+                        "thumbnail": self._get_hires_thumbnail_url(result.get("thumbnails") or []),
+                    }
+                )
             return songs
-
-        except Exception as e:
-            self._log("MUSIC_ERROR", f"Error searching songs: {e}")
+        except Exception as error:
+            self._log("MUSIC_ERROR", f"Search failed: {error}")
             return []
-    
+
     @staticmethod
-    def _get_hires_thumbnail_url(thumbnails: list, size: int = 2000) -> Optional[str]:
-        """Extract highest resolution thumbnail URL, upgrading size params if possible."""
+    def _get_hires_thumbnail_url(thumbnails: list, size: int = 2000) -> str | None:
         if not thumbnails:
             return None
-        url = thumbnails[-1].get('url', '')
-        if not url:
-            return None
-        # YouTube Music thumbnails use =w{N}-h{N} suffix — replace with larger size
-        url = re.sub(r'=w\d+-h\d+', f'=w{size}-h{size}', url)
-        return url
+        url = thumbnails[-1].get("url")
+        return re.sub(r"=w\d+-h\d+", f"=w{size}-h{size}", url) if url else None
 
-    async def _download_thumbnail(self, thumbnail_url: str, song_id: str) -> Optional[str]:
-        """Download thumbnail image to cache.
+    async def _download_song(self, video_id: str, output_path: str) -> bool:
+        """Publish a completed MP3 atomically, including when downloads overlap."""
 
-        Returns the path to the cached thumbnail, or None on failure.
-        Re-downloads if the cached version is too small.
-        """
-        thumb_path = self._get_cached_thumbnail_path(song_id)
-        if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
-            try:
-                img = Image.open(thumb_path)
-                if img.width >= 1000:
-                    return thumb_path
-                # Cached thumbnail is low-res, re-download
-            except Exception:
-                pass
+        cancelled = threading.Event()
+
+        def check_cancelled(_=None):
+            if cancelled.is_set():
+                raise yt_dlp.utils.DownloadError("Download cancelled")
+
+        def download():
+            # The worker owns its staging directory even if its awaiting task is cancelled.
+            with tempfile.TemporaryDirectory(prefix=".download-", dir=self.cache_dir) as staging:
+                options = {
+                    "format": "bestaudio/best",
+                    "outtmpl": f"{staging}/audio.%(ext)s",
+                    "quiet": True,
+                    "no_warnings": True,
+                    "noplaylist": True,
+                    "socket_timeout": 15,
+                    "retries": 2,
+                    "progress_hooks": [check_cancelled],
+                    "postprocessors": [
+                        {
+                            "key": "FFmpegExtractAudio",
+                            "preferredcodec": "mp3",
+                            "preferredquality": "192",
+                        }
+                    ],
+                }
+                with yt_dlp.YoutubeDL(options) as downloader:
+                    downloader.download([f"https://music.youtube.com/watch?v={video_id}"])
+                result = Path(staging) / "audio.mp3"
+                if not result.is_file() or result.stat().st_size == 0:
+                    raise OSError("Download produced no audio")
+                check_cancelled()
+                result.replace(output_path)
+
         try:
-            loop = asyncio.get_event_loop()
-            def _fetch():
-                resp = requests.get(thumbnail_url, timeout=10)
-                resp.raise_for_status()
-                with open(thumb_path, 'wb') as f:
-                    f.write(resp.content)
-            await loop.run_in_executor(None, _fetch)
-            if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
-                return thumb_path
-        except Exception as e:
-            self._log("THUMB_ERROR", f"Failed to download thumbnail: {e}")
-        return None
-
-    @staticmethod
-    def _is_iterm2() -> bool:
-        """Check whether output terminal is iTerm2."""
-        term_program = os.getenv("TERM_PROGRAM", "")
-        lc_terminal = os.getenv("LC_TERMINAL", "")
-        return (
-            term_program == "iTerm.app"
-            or lc_terminal.lower() == "iterm2"
-            or bool(os.getenv("ITERM_SESSION_ID"))
-        )
-
-    def _tmux_allows_passthrough(self) -> bool:
-        """Check tmux allow-passthrough setting (cached)."""
-        if not os.getenv("TMUX"):
+            await asyncio.to_thread(download)
             return True
-
-        if self._tmux_passthrough is not None:
-            return self._tmux_passthrough
-
-        try:
-            result = subprocess.run(
-                ["tmux", "show", "-gv", "allow-passthrough"],
-                capture_output=True,
-                text=True,
-                timeout=1,
-                check=False,
-            )
-            value = result.stdout.strip().lower()
-            self._tmux_passthrough = value in {"on", "all"}
-        except Exception:
-            self._tmux_passthrough = False
-
-        return self._tmux_passthrough
-
-    def _emit_iterm2_inline_image(self, image_path: str, width_percent: int = 70):
-        """Emit iTerm2 inline image escape sequence.
-
-        Uses tmux passthrough when running inside tmux.
-        """
-        with open(image_path, "rb") as image_file:
-            image_b64 = base64.b64encode(image_file.read()).decode("ascii")
-
-        name_b64 = base64.b64encode(os.path.basename(image_path).encode("utf-8")).decode("ascii")
-        payload = (
-            f"\033]1337;File=name={name_b64};inline=1;preserveAspectRatio=1;"
-            f"width={width_percent}%;height=auto:{image_b64}\a"
-        )
-
-        # iTerm2 image escape codes need tmux passthrough wrapping.
-        if os.getenv("TMUX"):
-            tmux_payload = payload.replace("\033", "\033\033")
-            sys.stdout.write(f"\033Ptmux;{tmux_payload}\033\\")
-        else:
-            sys.stdout.write(payload)
-        sys.stdout.flush()
-
-    def _render_thumbnail_iterm2(self, thumb_path: str, title: str, artist: str) -> bool:
-        """Render thumbnail via iTerm2's native inline image protocol."""
-        if not self._is_iterm2():
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        except Exception as error:
+            self._log("CACHE_ERROR", f"Download failed: {error}")
             return False
 
-        if os.getenv("TMUX") and not self._tmux_allows_passthrough():
-            if not self._logged_tmux_passthrough_hint:
-                self._logged_tmux_passthrough_hint = True
-                self._log(
-                    "THUMB_INFO",
-                    "tmux inline image passthrough is off. Enable with: set -g allow-passthrough on",
-                )
+    async def play_song(
+        self,
+        video_id: str,
+        title: str = "Unknown",
+        artist: str = "Unknown",
+        thumbnail_url: str | None = None,
+    ) -> bool:
+        if (
+            self._closed
+            or not isinstance(video_id, str)
+            or not re.fullmatch(r"[\w-]{11}", video_id, re.ASCII)
+        ):
             return False
-
+        await self.stop()
+        generation = self._generation
+        song_id = self._generate_song_id(video_id, title, artist)
+        audio_file = Path(self._get_cached_file_path(song_id))
         try:
-            print("")  # blank line before
-            self._emit_iterm2_inline_image(thumb_path, width_percent=70)
-            print(f"  \033[1m{title}\033[0m - {artist}")
-            print("")  # blank line after
-            return True
-        except Exception as e:
-            self._log("THUMB_ERROR", f"Failed to render iTerm2 image: {e}")
-            return False
-
-    def _render_thumbnail_in_terminal(self, thumb_path: str, title: str, artist: str):
-        """Render a thumbnail image in the terminal using ANSI colored half-block characters."""
-        try:
-            # Prefer native iTerm2 inline rendering for much higher visual quality.
-            if self._render_thumbnail_iterm2(thumb_path, title, artist):
-                return
-
-            img = Image.open(thumb_path).convert('RGB')
-
-            try:
-                term_size = os.get_terminal_size()
-                term_width = term_size.columns
-                term_height = term_size.lines
-            except OSError:
-                term_width = 80
-                term_height = 24
-
-            aspect = img.height / img.width
-            # 50% of terminal width
-            width_from_cols = int(term_width * 0.5)
-            # 50% of terminal height: each char row = 2 pixel rows
-            height_from_rows = int(term_height * 0.5)
-            width_from_height = int(height_from_rows * 2 / aspect)
-            # Use the smaller constraint so it stays compact in upper-left
-            new_width = min(width_from_cols, width_from_height)
-
-            new_height = int(new_width * aspect)
-            # Make height even for half-block pairing
-            if new_height % 2 != 0:
-                new_height += 1
-            img = img.resize((new_width, new_height), Image.LANCZOS)
-            pixels = img.load()
-
-            lines = []
-            lines.append("")  # blank line before
-            for y in range(0, new_height, 2):
-                row = ""
-                for x in range(new_width):
-                    # Top pixel -> foreground, bottom pixel -> background
-                    r1, g1, b1 = pixels[x, y]
-                    if y + 1 < new_height:
-                        r2, g2, b2 = pixels[x, y + 1]
-                    else:
-                        r2, g2, b2 = r1, g1, b1
-                    # Use upper half block with fg=top, bg=bottom
-                    row += f"\033[38;2;{r1};{g1};{b1}m\033[48;2;{r2};{g2};{b2}m\u2580"
-                row += "\033[0m"
-                lines.append(row)
-            lines.append(f"  \033[1m{title}\033[0m - {artist}")
-            lines.append("")  # blank line after
-
-            output = "\n".join(lines)
-            print(output)
-        except Exception as e:
-            self._log("THUMB_ERROR", f"Failed to render thumbnail: {e}")
-
-    async def play_song(self, video_id: str, title: str = "Unknown", artist: str = "Unknown", thumbnail_url: str = None) -> bool:
-        """
-        Play a song by video ID (with caching support)
-        
-        Args:
-            video_id: YouTube video ID
-            title: Song title for logging
-            artist: Artist name for caching
-            
-        Returns:
-            True if playback started successfully
-        """
-        try:
-            # Stop current playback if any
-            await self.stop()
-            
-            # Generate unique song ID
-            song_id = self._generate_song_id(video_id, title, artist)
-            cached_file = self._get_cached_file_path(song_id)
-            
-            self._log("MUSIC_PLAY", f"Starting playback: {title} by {artist}")
-            
-            # Check if song is cached
-            if self._is_song_cached(song_id):
-                self._log("CACHE_HIT", f"Playing cached version: {title}")
-                audio_file = cached_file
-                # Update play count
-                self._cache_song(song_id, video_id, title, artist, thumbnail_url)
-                # Fall back to cached thumbnail_url if not provided
-                if not thumbnail_url:
-                    metadata = self._load_metadata()
-                    thumbnail_url = metadata.get(song_id, {}).get('thumbnail_url')
-            else:
-                self._log("CACHE_MISS", f"Downloading: {title}")
-
-                # Download directly with yt-dlp (handles format + conversion)
-                if not await self._download_song(video_id, cached_file):
-                    self._log("MUSIC_ERROR", f"Failed to download: {title}")
+            if not audio_file.is_file() or audio_file.stat().st_size == 0:
+                if not await self._download_song(video_id, str(audio_file)):
                     return False
-
-                self._cache_song(song_id, video_id, title, artist, thumbnail_url)
-                audio_file = cached_file
-
-            # Download and display thumbnail
-            if thumbnail_url:
-                thumb_path = await self._download_thumbnail(thumbnail_url, song_id)
-                if thumb_path:
-                    self._render_thumbnail_in_terminal(thumb_path, title, artist)
-
-            # Start playback in separate thread
+            if generation != self._generation or self._closed:
+                return False
+            if not thumbnail_url:
+                thumbnail_url = self._load_metadata().get(song_id, {}).get("thumbnail_url")
+            # Album art is optional and skipped for redirected/headless output.
+            if thumbnail_url and self.album_art.is_visible():
+                thumbnail = await self.album_art.download(thumbnail_url, song_id)
+                if generation != self._generation or self._closed:
+                    return False
+                if thumbnail:
+                    self.album_art.render(thumbnail, title, artist)
+            if not pygame.mixer.get_init():
+                pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=1024)
+            pygame.mixer.music.load(str(audio_file))
+            # Loading a track resets pygame's volume.
+            pygame.mixer.music.set_volume(self.volume)
+            pygame.mixer.music.play()
             self.current_song = {
-                'videoId': video_id,
-                'title': title,
-                'artist': artist,
-                'song_id': song_id,
-                'audio_file': audio_file
+                "videoId": video_id,
+                "title": title,
+                "artist": artist,
+                "song_id": song_id,
+                "audio_file": str(audio_file),
             }
-            
             self.is_playing = True
             self.is_paused = False
-            
-            # Start playback thread
-            self.playback_thread = threading.Thread(
-                target=self._play_cached_audio,
-                args=(audio_file, f"{artist} - {title}"),
-                daemon=True
-            )
-            self.playback_thread.start()
-            
+            self._cache_song(song_id, video_id, title, artist, thumbnail_url)
+            self._log("MUSIC_PLAYBACK", f"Playing: {title} by {artist}")
             return True
-            
-        except Exception as e:
-            self._log("MUSIC_ERROR", f"Error playing song: {e}")
-            return False
-    
-    async def _download_song(self, video_id: str, output_path: str) -> bool:
-        """Download song directly with yt-dlp (non-blocking).
-
-        Uses yt-dlp's built-in postprocessing to convert to mp3 in one step,
-        avoiding fragile URL extraction + separate ffmpeg calls.
-        """
-        try:
-            # Strip .mp3 extension — yt-dlp adds it via postprocessor
-            output_base = output_path.rsplit('.', 1)[0] if output_path.endswith('.mp3') else output_path
-
-            ydl_opts = {
-                'format': 'bestaudio/best',
-                'outtmpl': f'{output_base}.%(ext)s',
-                'quiet': True,
-                'no_warnings': True,
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '192',
-                }],
-            }
-
-            youtube_url = f"https://music.youtube.com/watch?v={video_id}"
-
-            # Run sync yt-dlp download in thread pool to avoid blocking event loop
-            loop = asyncio.get_event_loop()
-            def _download():
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([youtube_url])
-
-            await loop.run_in_executor(None, _download)
-
-            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-                self._log("CACHE_DOWNLOAD", f"Downloaded to cache: {output_path}")
-                return True
-
-            self._log("CACHE_ERROR", f"Download produced no output: {output_path}")
+        except asyncio.CancelledError:
+            if generation == self._generation:
+                await self.stop()
+            raise
+        except Exception as error:
+            if generation == self._generation:
+                await self.stop()
+            self._log("MUSIC_ERROR", f"Playback failed: {error}")
             return False
 
-        except Exception as e:
-            self._log("CACHE_ERROR", f"Error downloading song: {e}")
-            if os.path.exists(output_path):
-                try:
-                    os.unlink(output_path)
-                except Exception:
-                    pass
-            return False
-    
-    def _play_cached_audio(self, audio_file: str, title: str):
-        """Play cached audio file using pygame (runs in separate thread)"""
-        try:
-            if not os.path.exists(audio_file):
-                self._log("MUSIC_ERROR", f"Cached file not found: {audio_file}")
-                return
-            
-            self._log("MUSIC_PLAYBACK", f"Playing cached audio: {title}")
-            
-            # Load and play with pygame
-            with self._playback_lock:
-                if not self.is_playing:
-                    return
-                pygame.mixer.music.load(audio_file)
-                # Loading a track resets pygame's volume to full scale.
-                pygame.mixer.music.set_volume(self.volume)
-                pygame.mixer.music.play()
-                if self.is_paused:
-                    pygame.mixer.music.pause()
-            
-            # Monitor playback
-            while True:
-                with self._playback_lock:
-                    if not self.is_playing:
-                        break
-                    # pygame reports not busy while paused. Keep the track
-                    # alive until it is resumed, stopped, or actually ends.
-                    if not self.is_paused and not pygame.mixer.music.get_busy():
-                        self._log("MUSIC_FINISHED", f"Finished playing: {title}")
-                        self.is_playing = False
-                        self.current_song = None
-                        break
-                time.sleep(0.1)
-            
-        except Exception as e:
-            self._log("MUSIC_ERROR", f"Error in cached audio playback: {e}")
-        finally:
-            self.is_playing = False
-    
-    
     async def pause(self) -> bool:
-        """Keep playback paused until an explicit resume, including after a conversation."""
-        with self._playback_lock:
-            if not self.is_playing:
-                return False
-            pygame.mixer.music.pause()
-            self.is_paused = True
-            self.was_paused_for_conversation = False
-            self._log("MUSIC_PAUSE", f"Paused: {self.current_song.get('title', 'Unknown') if self.current_song else 'Unknown'}")
-            return True
-    
-    async def resume(self) -> bool:
-        """Resume paused playback"""
-        with self._playback_lock:
-            if not (self.is_playing and self.is_paused):
-                return False
-            pygame.mixer.music.unpause()
-            self.is_paused = False
-            self.was_paused_for_conversation = False  # Clear conversation pause flag
-            self._log("MUSIC_RESUME", f"Resumed: {self.current_song.get('title', 'Unknown') if self.current_song else 'Unknown'}")
-            return True
-    
-    async def pause_for_conversation(self) -> bool:
-        """Pause music for voice conversation"""
-        with self._playback_lock:
-            if not (self.is_playing and not self.is_paused):
-                return False
-            pygame.mixer.music.pause()
-            self.is_paused = True
-            self.was_paused_for_conversation = True
-            self._log("MUSIC_CONV_PAUSE", f"Paused for conversation: {self.current_song.get('title', 'Unknown') if self.current_song else 'Unknown'}")
-            return True
-    
-    async def resume_after_conversation(self) -> bool:
-        """Resume music after voice conversation if it was paused for conversation"""
-        with self._playback_lock:
-            if not (self.is_playing and self.is_paused and self.was_paused_for_conversation):
-                return False
-            pygame.mixer.music.unpause()
-            self.is_paused = False
-            self.was_paused_for_conversation = False
-            self._log("MUSIC_CONV_RESUME", f"Resumed after conversation: {self.current_song.get('title', 'Unknown') if self.current_song else 'Unknown'}")
-            return True
-    
-    async def stop(self) -> bool:
-        """Stop current playback"""
-        self.was_paused_for_conversation = False
-        if self.is_playing:
-            self.is_playing = False
-            self.is_paused = False
-            
-            # Stop pygame mixer if initialized
-            try:
-                if pygame.mixer.get_init():
-                    pygame.mixer.music.stop()
-            except pygame.error as e:
-                self._log("MUSIC_ERROR", f"Pygame mixer stop error: {e}")
-            
-            # Wait for playback thread to finish
-            if self.playback_thread and self.playback_thread.is_alive():
-                self.playback_thread.join(timeout=2)
-            
-            song_title = self.current_song.get('title', 'Unknown') if self.current_song else 'Unknown'
-            self.current_song = None
-            
-            self._log("MUSIC_STOP", f"Stopped: {song_title}")
-            
-            return True
-        return False
-    
-    def get_cache_info(self) -> dict:
-        """Get information about cached songs"""
-        try:
-            metadata = self._load_metadata()
-            total_songs = len(metadata)
-            
-            # Calculate total cache size
-            total_size = 0
-            for song_id in metadata:
-                cached_file = self._get_cached_file_path(song_id)
-                if os.path.exists(cached_file):
-                    total_size += os.path.getsize(cached_file)
-            
-            return {
-                'total_songs': total_songs,
-                'total_size_mb': round(total_size / (1024 * 1024), 2),
-                'cache_dir': self.cache_dir,
-                'most_played': sorted(metadata.items(), 
-                                    key=lambda x: x[1].get('play_count', 0), 
-                                    reverse=True)[:5]
-            }
-        except Exception as e:
-            self._log("CACHE_ERROR", f"Error getting cache info: {e}")
-            return {'error': str(e)}
-    
-    def get_status(self) -> dict:
-        """Get current playback status"""
-        return {
-            'is_playing': self.is_playing,
-            'is_paused': self.is_paused,
-            'current_song': self.current_song
-        }
-    
-    async def play_search_result(self, query: str, index: int = 0) -> bool:
-        """
-        Search and play the first (or specified index) result
-        
-        Args:
-            query: Search query
-            index: Index of search result to play (default: 0)
-            
-        Returns:
-            True if song started playing
-        """
-        try:
-            # Search for songs
-            songs = await self.search_songs(query, limit=max(5, index + 1))
-            
-            if not songs:
-                self._log("MUSIC_ERROR", f"No songs found for: {query}")
-                return False
-            
-            if index >= len(songs):
-                self._log("MUSIC_ERROR", f"Search result index {index} out of range (found {len(songs)} songs)")
-                return False
-            
-            # Play the selected song
-            song = songs[index]
-            return await self.play_song(song['videoId'], song['title'], song['artist'], song.get('thumbnail'))
-            
-        except Exception as e:
-            self._log("MUSIC_ERROR", f"Error playing search result: {e}")
+        self._refresh_playback()
+        if not self.is_playing:
             return False
-    
-    def cleanup(self):
-        """Clean up resources"""
-        try:
-            # Stop any current playback synchronously
-            if self.is_playing:
-                self.is_playing = False
-                self.is_paused = False
-                
-                # Stop pygame mixer if initialized
-                try:
-                    if pygame.mixer.get_init():
-                        pygame.mixer.music.stop()
-                except pygame.error as e:
-                    self._log("MUSIC_ERROR", f"Pygame mixer stop error: {e}")
-                
-                # Wait for playback thread to finish
-                if self.playback_thread and self.playback_thread.is_alive():
-                    self.playback_thread.join(timeout=2)
-                
-                self.current_song = None
-            
-            # Cleanup pygame if initialized
-            try:
-                if pygame.mixer.get_init():
-                    pygame.mixer.quit()
-            except pygame.error as e:
-                self._log("MUSIC_ERROR", f"Pygame mixer cleanup error: {e}")
+        pygame.mixer.music.pause()
+        self.is_paused = True
+        self.was_paused_for_conversation = False
+        return True
 
-            self._log("MUSIC_CLEANUP", "YouTube Music player cleaned up")
+    async def resume(self) -> bool:
+        self._refresh_playback()
+        if not (self.is_playing and self.is_paused):
+            return False
+        pygame.mixer.music.unpause()
+        self.is_paused = False
+        self.was_paused_for_conversation = False
+        return True
 
-        except Exception as e:
-            self._log("MUSIC_ERROR", f"Error during cleanup: {e}")
+    async def pause_for_conversation(self) -> bool:
+        self._refresh_playback()
+        if not self.is_playing or self.is_paused:
+            return False
+        await self.pause()
+        self.was_paused_for_conversation = True
+        return True
+
+    async def resume_after_conversation(self) -> bool:
+        if not self.was_paused_for_conversation:
+            return False
+        return await self.resume()
+
+    async def stop(self) -> bool:
+        """Also invalidate pending searches/downloads before they can start a track."""
+        self._generation += 1
+        had_track = self.is_playing
+        self._clear_track()
+        if pygame.mixer.get_init():
+            pygame.mixer.music.stop()
+            pygame.mixer.music.unload()
+        return had_track
+
+    def get_status(self) -> dict:
+        self._refresh_playback()
+        return {
+            "is_playing": self.is_playing,
+            "is_paused": self.is_paused,
+            "current_song": dict(self.current_song) if self.current_song else None,
+        }
+
+    def get_cache_info(self) -> dict:
+        entries = {
+            key: value
+            for key, value in self._load_metadata().items()
+            if Path(self._get_cached_file_path(key)).is_file()
+        }
+        size = sum(Path(self._get_cached_file_path(key)).stat().st_size for key in entries)
+        return {
+            "total_songs": len(entries),
+            "total_size_mb": round(size / 1024**2, 2),
+            "cache_dir": self.cache_dir,
+            "most_played": sorted(
+                entries.items(),
+                key=lambda item: (
+                    item[1].get("play_count", 0)
+                    if isinstance(item[1].get("play_count", 0), int)
+                    else 0
+                ),
+                reverse=True,
+            )[:5],
+        }
+
+    async def play_search_result(self, query: str, index: int = 0) -> bool:
+        if index < 0 or self._closed:
+            return False
+        self._generation += 1
+        generation = self._generation
+        songs = await self.search_songs(query, limit=max(5, index + 1))
+        if generation != self._generation or self._closed or index >= len(songs):
+            return False
+        song = songs[index]
+        return await self.play_song(
+            song["videoId"], song["title"], song["artist"], song["thumbnail"]
+        )
+
+    def cleanup(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._generation += 1
+        self._clear_track()
+        if pygame.mixer.get_init():
+            pygame.mixer.quit()

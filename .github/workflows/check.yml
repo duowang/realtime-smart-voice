@@ -1,0 +1,26 @@
+name: Check
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - name: Install audio build libraries
+        run: sudo apt-get update && sudo apt-get install -y portaudio19-dev libsndfile1
+      - name: Install Python dependencies
+        run: |
+          python -m venv venv
+          make dev-deps
+      - name: Compile, lint and test without hardware or API credentials
+        run: |
+          bash -n run.sh
+          make check

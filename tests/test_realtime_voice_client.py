@@ -1,93 +1,74 @@
 import asyncio
-import importlib
+import base64
 import json
-import sys
-import types
-from pathlib import Path
+import threading
+import time
 from unittest.mock import AsyncMock, Mock
 
-import numpy as np
 import pytest
 
-SRC_DIR = Path(__file__).resolve().parents[1] / "src"
-sys.path.insert(0, str(SRC_DIR))
-
-sys.modules.setdefault("pyaudio", types.SimpleNamespace())
-sys.modules.setdefault("websockets", types.SimpleNamespace())
-
-if "music_commands" not in sys.modules:
-    music_commands = types.ModuleType("music_commands")
-    music_commands.MusicCommandHandler = object
-    sys.modules["music_commands"] = music_commands
-
-RealtimeVoiceClient = importlib.import_module("realtime_voice_client").RealtimeVoiceClient
+import realtime_voice_client as module
+from realtime_voice_client import RealtimeVoiceClient
 
 
 @pytest.fixture
 def client(monkeypatch):
-    monkeypatch.setattr(RealtimeVoiceClient, "_init_audio", lambda _: None)
-    handler = Mock()
+    monkeypatch.setattr(module, "get_api_key", lambda _: "test-key")
+    audio = Mock()
+    audio.open.return_value.read.return_value = b"\0" * 2048
+    monkeypatch.setattr(module.pyaudio, "PyAudio", Mock(return_value=audio))
+    handler = Mock(pause_for_conversation=AsyncMock(), resume_after_conversation=AsyncMock())
     handler.get_status.return_value = {"is_playing": True, "is_paused": True}
     return RealtimeVoiceClient({"openai_api_key": "test-key"}, music_handler=handler)
 
 
-def test_default_realtime_model_matches_current_generation():
-    assert RealtimeVoiceClient.DEFAULT_REALTIME_MODEL == "gpt-realtime-2.1"
+def socket_for(client, monkeypatch, events):
+    async def receive():
+        if events:
+            return json.dumps(events.pop(0))
+        await asyncio.Future()
+
+    socket = Mock(send=AsyncMock(), recv=receive, close=AsyncMock())
+    monkeypatch.setattr(module.websockets, "connect", AsyncMock(return_value=socket))
+    return socket
 
 
-def test_calculate_rms_handles_full_scale_pcm16_without_overflow():
-    samples = np.array([32767, -32768], dtype=np.int16)
-
-    rms = RealtimeVoiceClient._calculate_rms(samples.tobytes())
-
-    assert rms == pytest.approx(32767.5, abs=0.5)
-
-
-def test_calculate_rms_returns_zero_for_empty_audio():
-    assert RealtimeVoiceClient._calculate_rms(b"") == 0.0
-
-
-def test_music_start_returns_to_wake_mode_without_requesting_more_speech():
-    client = object.__new__(RealtimeVoiceClient)
-    client.is_connected = True
-    client.conversation_should_end = False
-    client._log = Mock()
-    client.music_handler = Mock(execute=AsyncMock(return_value={"success": True, "action": "play"}))
-    client.stop_conversation = AsyncMock()
-    client.websocket = Mock(send=AsyncMock(), recv=AsyncMock(return_value=json.dumps({
-        "type": "response.function_call_arguments.done", "name": "play_music",
-        "arguments": '{"query":"test"}', "call_id": "test-call",
-    })))
-    asyncio.run(client._handle_responses())
-    assert client.conversation_should_end
-    client.stop_conversation.assert_awaited_once()
-    events = [json.loads(c.args[0]) for c in client.websocket.send.call_args_list]
-    assert [event["type"] for event in events] == ["conversation.item.create"]
-
-
-def test_realtime_connection_bounds_close_handshake(monkeypatch):
-    module = importlib.import_module("realtime_voice_client")
-    connect = AsyncMock(return_value=Mock(send=AsyncMock()))
-    monkeypatch.setattr(module.websockets, "connect", connect, raising=False)
-    client = object.__new__(RealtimeVoiceClient)
-    client.config = {}
-    client.api_key = "test-key"
-    client._build_session_config = Mock(return_value={})
-    client._log = Mock()
+def test_realtime_connection_waits_for_configuration(client, monkeypatch):
+    socket_for(client, monkeypatch, [{"type": "session.created"}, {"type": "session.updated"}])
     asyncio.run(client.initialize())
-    assert connect.call_args.kwargs["close_timeout"] == 1
+    assert module.websockets.connect.call_args.kwargs["close_timeout"] == 1
+    module.pyaudio.PyAudio.assert_not_called()
 
 
-@pytest.mark.parametrize("text", [
-    "Stop the music.", "Stop playing.", "Stop.",
-    "Please play Bye Bye Bye.", "Pause the music, thanks.",
-    "I'm not finished with my question.",
-])
+def test_invalid_server_session_closes_socket_without_opening_mic(client, monkeypatch):
+    socket = socket_for(
+        client, monkeypatch, [{"type": "error", "error": {"message": "bad config"}}]
+    )
+    with pytest.raises(RuntimeError, match="configuration rejected"):
+        asyncio.run(client.start_conversation())
+    socket.close.assert_awaited_once()
+    module.pyaudio.PyAudio.assert_not_called()
+    client.music_handler.resume_after_conversation.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Stop the music.",
+        "Stop playing.",
+        "Stop.",
+        "Please play Bye Bye Bye.",
+        "Pause the music, thanks.",
+        "I'm not finished with my question.",
+    ],
+)
 def test_music_commands_and_mentions_do_not_end_conversation(client, text):
     assert not client._should_end_conversation(text)
 
 
-@pytest.mark.parametrize("text", ["Goodbye!", "Thank you.", "Okay, that's all.", "Please end conversation."])
+@pytest.mark.parametrize(
+    "text", ["Goodbye!", "Thank you.", "Okay, that's all.", "Please end conversation."]
+)
 def test_standalone_farewells_still_end_conversation(client, text):
     assert client._should_end_conversation(text)
 
@@ -97,21 +78,248 @@ def test_stop_without_music_ends_conversation(client):
     assert client._should_end_conversation("Stop.")
 
 
-def test_stop_music_transcript_reaches_the_function_handler(client):
-    client.is_connected = True
-    client.stop_conversation = AsyncMock()
+def tool_response(name, arguments="{}"):
+    return {
+        "type": "response.done",
+        "response": {
+            "status": "completed",
+            "output": [
+                {
+                    "type": "function_call",
+                    "name": name,
+                    "arguments": arguments,
+                    "call_id": "call-test",
+                }
+            ],
+        },
+    }
 
-    async def execute(*_):
-        client.is_connected = False
-        return {"success": True, "action": "stop"}
 
-    client.music_handler.execute = AsyncMock(side_effect=execute)
-    client.websocket = Mock(send=AsyncMock(), recv=AsyncMock(side_effect=[
-        json.dumps({"type": "conversation.item.input_audio_transcription.completed",
-                    "transcript": "Stop the music."}),
-        json.dumps({"type": "response.function_call_arguments.done", "name": "stop_music",
-                    "arguments": "{}", "call_id": "stop-call"}),
-    ]))
-    asyncio.run(client._handle_responses())
+def test_stop_music_transcript_reaches_function_handler_once(client):
+    client.websocket = Mock(send=AsyncMock())
+    client.music_handler.execute = AsyncMock(return_value={"success": True, "action": "stop"})
+
+    async def run():
+        await client._handle_event(
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "transcript": "Stop the music.",
+            }
+        )
+        # The earlier arguments event must not trigger a duplicate execution or response.
+        await client._handle_event(
+            {"type": "response.function_call_arguments.done", "name": "stop_music"}
+        )
+        client.music_handler.execute.assert_not_awaited()
+        await client._handle_event(tool_response("stop_music"))
+
+    asyncio.run(run())
     client.music_handler.execute.assert_awaited_once_with("stop_music", {})
-    client.stop_conversation.assert_not_awaited()
+    assert not client.conversation_should_end
+    sent = [json.loads(call.args[0])["type"] for call in client.websocket.send.call_args_list]
+    assert sent == ["conversation.item.create", "response.create"]
+
+
+def test_music_start_returns_to_wake_mode_without_more_speech(client):
+    client.websocket = Mock(send=AsyncMock())
+    client.music_handler.execute = AsyncMock(return_value={"success": True, "action": "play"})
+    asyncio.run(client._handle_event(tool_response("play_music", '{"query":"test"}')))
+    assert client.conversation_should_end
+    assert client._stop_event.is_set()
+    assert client.websocket.send.await_count == 1
+
+
+def test_invalid_function_json_cannot_silently_execute_stop(client):
+    client.websocket = Mock(send=AsyncMock())
+    client.music_handler.execute = AsyncMock(return_value={"success": False})
+    asyncio.run(client._handle_event(tool_response("stop_music", "{")))
+    client.music_handler.execute.assert_awaited_once_with("stop_music", None)
+
+
+def test_microphone_failure_cancels_siblings_and_closes_resources(client, monkeypatch):
+    socket = socket_for(client, monkeypatch, [{"type": "session.updated"}])
+    stream = module.pyaudio.PyAudio.return_value.open.return_value
+    stream.read.side_effect = OSError("microphone disconnected")
+
+    async def run():
+        with pytest.raises(OSError, match="disconnected"):
+            await client.start_conversation()
+        assert not [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+
+    asyncio.run(run())
+    stream.close.assert_called_once()
+    socket.close.assert_awaited_once()
+    assert client._conversation_task is None
+    assert not client.is_connected
+
+
+def test_cancelled_session_closes_and_can_be_reused(client, monkeypatch):
+    sockets = []
+
+    async def run():
+        for _ in range(2):
+            socket = socket_for(client, monkeypatch, [{"type": "session.updated"}])
+            sockets.append(socket)
+            task = asyncio.create_task(client.start_conversation())
+            while not client.is_connected:
+                await asyncio.sleep(0)
+            client._assistant_text_buffer = "old response"
+            await client.stop_conversation()
+            assert task.done()
+            assert client._conversation_task is None
+        await client.cleanup()
+        assert not [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+
+    asyncio.run(run())
+    assert all(socket.close.await_count == 1 for socket in sockets)
+    module.pyaudio.PyAudio.return_value.terminate.assert_called_once()
+    client.music_handler.cleanup.assert_not_called()  # Shared player belongs to the assistant.
+
+
+def test_failed_audio_open_releases_connection(client, monkeypatch):
+    socket = socket_for(client, monkeypatch, [{"type": "session.updated"}])
+    module.pyaudio.PyAudio.return_value.open.side_effect = OSError("no input device")
+    with pytest.raises(OSError, match="input device"):
+        asyncio.run(client.start_conversation())
+    socket.close.assert_awaited_once()
+    assert client.stream is None
+
+
+def test_failed_response_propagates_instead_of_hanging(client, monkeypatch):
+    socket = socket_for(
+        client,
+        monkeypatch,
+        [
+            {"type": "session.updated"},
+            {"type": "response.done", "response": {"status": "failed", "status_details": "quota"}},
+        ],
+    )
+    with pytest.raises(RuntimeError, match="quota"):
+        asyncio.run(asyncio.wait_for(client.start_conversation(), 1))
+    socket.close.assert_awaited_once()
+
+
+def test_barge_in_discards_queued_audio_and_truncates_played_duration(client):
+    written, release = threading.Event(), threading.Event()
+    client.audio = Mock()
+    client.websocket = Mock(send=AsyncMock())
+
+    def write(_):
+        written.set()
+        assert release.wait(2)
+
+    client.audio.open.return_value.write.side_effect = write
+
+    async def run():
+        await client._handle_event(
+            {
+                "type": "response.output_audio.delta",
+                "item_id": "spoken-item",
+                "delta": base64.b64encode(b"\0" * 4800).decode(),
+            }
+        )
+        playback = asyncio.create_task(client._play_output())
+        try:
+            while not written.is_set():
+                await asyncio.sleep(0)
+            interruption = asyncio.create_task(
+                client._handle_event({"type": "input_audio_buffer.speech_started"})
+            )
+            await asyncio.sleep(0)
+            assert client._output_queue.empty()
+            release.set()
+            await asyncio.wait_for(interruption, 1)
+            sent = json.loads(client.websocket.send.call_args.args[0])
+            assert sent == {
+                "type": "conversation.item.truncate",
+                "item_id": "spoken-item",
+                "content_index": 0,
+                "audio_end_ms": 20,
+            }
+            assert client.audio.open.return_value.write.call_count == 1
+        finally:
+            release.set()
+            playback.cancel()
+            await asyncio.gather(playback, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+def test_silence_timeout_does_not_interrupt_tool_or_output(client):
+    async def run():
+        client.config["silence_timeout"] = 0.01
+        client.last_user_activity_time = time.monotonic() - 30
+        client._tool_in_progress = True
+        monitor = asyncio.create_task(client._monitor_silence())
+        await asyncio.sleep(0.15)
+        assert not client.conversation_should_end
+        client._tool_in_progress = False
+        await asyncio.wait_for(monitor, 1)
+        assert client.conversation_should_end
+
+    asyncio.run(run())
+
+
+def test_interrupt_before_playback_truncates_new_item_at_zero(client):
+    client.websocket = Mock(send=AsyncMock())
+    client._played_item = "previous-response"
+    client._played_bytes = 96000
+
+    async def run():
+        await client._handle_event(
+            {
+                "type": "response.output_audio.delta",
+                "item_id": "new-response",
+                "delta": base64.b64encode(b"\0" * 960).decode(),
+            }
+        )
+        await client._interrupt_output()
+
+    asyncio.run(run())
+    sent = json.loads(client.websocket.send.call_args.args[0])
+    assert sent["item_id"] == "new-response"
+    assert sent["audio_end_ms"] == 0
+
+
+def test_shutdown_does_not_resume_music(client, monkeypatch):
+    socket_for(client, monkeypatch, [{"type": "session.updated"}])
+
+    async def run():
+        owner = asyncio.create_task(client.start_conversation())
+        while not client.is_connected:
+            await asyncio.sleep(0)
+        await client.stop_conversation(resume_music=False)
+        assert owner.done()
+
+    asyncio.run(run())
+    client.music_handler.resume_after_conversation.assert_not_awaited()
+
+
+def test_repeated_cancellation_during_native_read_still_cleans_up(client, monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    socket = socket_for(client, monkeypatch, [{"type": "session.updated"}])
+    stream = module.pyaudio.PyAudio.return_value.open.return_value
+
+    def read(*_, **__):
+        entered.set()
+        assert release.wait(2)
+        return b"\0" * 2048
+
+    stream.read.side_effect = read
+
+    async def run():
+        owner = asyncio.create_task(client.start_conversation())
+        while not entered.is_set():
+            await asyncio.sleep(0)
+        for _ in range(2):
+            owner.cancel()
+            await asyncio.sleep(0)
+        stream.close.assert_not_called()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await owner
+        stream.close.assert_called_once()
+        socket.close.assert_awaited_once()
+        assert client._conversation_task is None
+
+    asyncio.run(run())

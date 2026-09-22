@@ -8,7 +8,7 @@ A voice assistant powered by OpenAI's Realtime API for direct audio-to-audio con
 - **Offline wake word** ("Hi Taco" default) via sherpa-onnx, with no account or access key
 - **YouTube Music** playback with voice commands and smart local caching
 - **Album art** displayed in terminal during playback (ANSI true-color)
-- **Async architecture** — non-blocking audio throughout
+- **Async audio I/O** with bounded conversation timeouts and orderly shutdown
 
 ## Quick Start
 
@@ -75,7 +75,7 @@ After that download, wake-word detection runs locally without network access or 
 | Play | "Play Bohemian Rhapsody", "Play something by Adele" |
 | Pause / Resume | "Pause", "Resume", "Continue playing" |
 | Stop | "Stop music" |
-| Skip | "Next song", "Skip" |
+| Skip | "Skip" (stops the track; choose another song afterward) |
 
 Say **"Hi Taco"** while music is playing, wait for the greeting, then say **"pause the music"**. Music pauses immediately on wake-up. It resumes after ordinary conversations, but an explicit pause keeps it paused until you request resume. Songs and album art are cached locally in `music_cache/`.
 
@@ -94,7 +94,7 @@ Run checks:
 
 ```bash
 python -m compileall src
-ruff check src
+ruff check src tests generate_audio.py
 pytest
 ```
 
@@ -129,7 +129,9 @@ Set the API key in `.env` (recommended):
 OPENAI_API_KEY=...
 ```
 
-Set runtime options in `config/config.json`. Conversation timeout defaults to 120 seconds, silence timeout to 8 seconds, and the pause after an assistant response to 6 seconds. Override these with `conversation_timeout`, `silence_timeout`, and `post_response_timeout`, respectively.
+Set runtime options in `config/config.json`, or pass `./run.sh --config path/to/config.json` (relative to the project root). Invalid or missing configuration now fails at startup with an error. Existing shell environment variables override `.env`, which overrides the optional key in JSON. The runner parses `.env` as data rather than executing it.
+
+Conversation timeout defaults to 120 seconds, silence timeout to 8 seconds, and the pause after an assistant response to 6 seconds. Override these with `conversation_timeout`, `silence_timeout`, and `post_response_timeout`, respectively. The overall timeout covers greeting, connection setup, tool execution, and conversation. Silence is measured from server voice activity; assistant playback and active tool work do not count as user silence.
 
 The default Realtime stack uses `gpt-realtime-2.1` with the `marin` voice. You can override it in `config/config.json`:
 ```json
@@ -163,12 +165,21 @@ src/
   wake_word_model.py           # Pinned model download and cache
   realtime_voice_client.py     # OpenAI Realtime API (WebSocket)
   music_commands.py            # Music command handler
-  youtube_music_player.py      # YouTube Music player, caching, thumbnail rendering
+  youtube_music_player.py      # YouTube Music search, caching and mixer controls
+  album_art.py                 # Optional terminal thumbnail rendering
+  audio_io.py                  # Cancellation-safe device I/O and stream cleanup
+  configuration.py             # Shared paths, config validation and API key loading
 config/config.json             # App configuration
 models/                        # Downloaded wake-word model (ignored by Git)
 music_cache/                   # Cached audio (*.mp3), thumbnails (*_thumb.jpg), metadata
 logs/                          # Application logs
 ```
+
+## Runtime and test coverage
+
+Each conversation owns its microphone, speaker queue, WebSocket, and worker tasks. Interrupting a response discards queued speech and truncates the server conversation to the audio submitted for playback. Music uses pygame’s own playback engine; a stop invalidates pending searches/downloads so they cannot restart playback. Cache files are published after complete downloads, and explicit pause cancels automatic resume. Logs rotate at 5 MB with two backups.
+
+`make check` runs offline, with hardware/network boundaries mocked per test. GitHub Actions runs the same checks on Python 3.12. The optional headless test above uses real services and the model; it is not part of CI and can incur normal API usage. Physical microphone/speaker testing is still needed for room acoustics and echo.
 
 ## Troubleshooting
 
