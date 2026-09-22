@@ -1,168 +1,157 @@
 #!/usr/bin/env bash
-
-# Realtime Smart Voice Assistant runner.
-# Bootstraps local dependencies, validates config, then starts the assistant.
-
+# Set up a local Python environment, or start the assistant from an existing one.
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+usage() {
+    cat <<'HELP'
+Usage: ./run.sh [--setup-only | --doctor] [--config PATH]
 
-SETUP_ONLY=false
-ASSISTANT_ARGS=()
-PYTHON_BIN="python3.12"
-for arg in "$@"; do
-    case "$arg" in
-        --setup-only)
-            SETUP_ONLY=true
+  (no option)     Set up if needed, then start listening for "Hi Taco".
+  --setup-only   Install dependencies, prepare the wake model and create .env.
+                 Does not start audio or require an OpenAI API key.
+  --doctor       Check this installation without downloads or audio devices.
+  --config PATH  Use another JSON config (relative to the repository root).
+  -h, --help     Show this help without installing anything.
+
+First time: follow the system prerequisites in README.md, then:
+  ./run.sh --setup-only
+  # Edit .env and add your OpenAI API key.
+  ./run.sh
+HELP
+}
+
+fail() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+command_exists() { command -v "$1" >/dev/null 2>&1; }
+
+MODE=run
+CONFIG_FILE=config/config.json
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --setup-only|--doctor)
+            [[ "$MODE" == run ]] || fail "Choose either --setup-only or --doctor."
+            MODE="${1#--}"
+            shift
             ;;
-        *)
-            ASSISTANT_ARGS+=("$arg")
+        --config)
+            [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || fail "--config needs a file path."
+            CONFIG_FILE="$2"
+            shift 2
             ;;
+        --config=*) CONFIG_FILE="${1#--config=}"; shift ;;
+        *) fail "Unknown option: $1. Run ./run.sh --help." ;;
     esac
 done
+[[ -f "$CONFIG_FILE" ]] || fail "Config not found: $CONFIG_FILE"
 
-log_info() {
-    echo -e "${YELLOW}$1${NC}"
+check_venv() {
+    local version
+    version="$(venv/bin/python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || true)"
+    [[ "$version" == 3.12 ]] || fail "The existing venv uses Python ${version:-unknown}; 3.12 is required. Move venv aside, then run ./run.sh --setup-only."
 }
 
-log_ok() {
-    echo -e "${GREEN}$1${NC}"
-}
-
-log_err() {
-    echo -e "${RED}$1${NC}"
-}
-
-command_exists() {
-    command -v "$1" >/dev/null 2>&1
-}
-
-compute_sha256() {
-    local file="$1"
-    if command_exists shasum; then
-        shasum -a 256 "$file" | awk '{print $1}'
-    elif command_exists sha256sum; then
-        sha256sum "$file" | awk '{print $1}'
-    else
-        openssl dgst -sha256 "$file" | awk '{print $2}'
-    fi
-}
-
-echo -e "${BLUE}=== Realtime Smart Voice Assistant ===${NC}"
-
-if ! command_exists "$PYTHON_BIN"; then
-    log_err "ERROR: Python 3.12 is required but not found."
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-        echo "Install it with: brew install python@3.12"
-    else
-        echo "Install Python 3.12 and its venv support using your package manager."
-    fi
-    exit 1
+# This path is deliberately read-only, even on an incomplete installation.
+if [[ "$MODE" == doctor ]]; then
+    [[ -x venv/bin/python ]] || fail "No usable venv. Run ./run.sh --setup-only first."
+    check_venv
+    export PYTHONDONTWRITEBYTECODE=1
+    exec venv/bin/python src/setup_assistant.py --config "$CONFIG_FILE"
 fi
 
-# Check for system dependencies
-if [[ "$OSTYPE" == "darwin"* ]]; then
-    log_info "Checking macOS dependencies..."
+case "$(uname -s)" in
+    Darwin|Linux) ;;
+    *) fail "The runner supports macOS and Linux. See README.md for prerequisites." ;;
+esac
 
-    if ! command_exists brew; then
-        log_err "ERROR: Homebrew is required on macOS to install dependencies."
-        echo "Install Homebrew from: https://brew.sh/"
-        exit 1
-    fi
-
-    if ! brew list portaudio &>/dev/null; then
-        log_info "Installing PortAudio..."
-        brew install portaudio
-        log_ok "PortAudio installed."
-    fi
-
-    if ! command_exists ffmpeg; then
-        log_info "Installing FFmpeg..."
-        brew install ffmpeg
-        log_ok "FFmpeg installed."
-    fi
-
-elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
-    log_info "Checking Linux dependencies..."
-
-    if command_exists apt-get; then
-        if ! dpkg -s portaudio19-dev >/dev/null 2>&1; then
-            log_info "Installing system dependencies via apt..."
-            sudo apt-get update
-            sudo apt-get install -y portaudio19-dev python3-pyaudio python3-pip python3-venv ffmpeg
-            log_ok "System dependencies installed."
+SYSTEM_DEPS_READY=false
+install_system_deps() {
+    [[ "$SYSTEM_DEPS_READY" == false ]] || return 0
+    if [[ "$(uname -s)" == Darwin ]]; then
+        command_exists brew || fail "Install Homebrew from https://brew.sh, then: brew install uv portaudio ffmpeg"
+        local packages=()
+        brew list portaudio >/dev/null 2>&1 || packages+=(portaudio)
+        command_exists ffmpeg || packages+=(ffmpeg)
+        if [[ ${#packages[@]} -gt 0 ]]; then
+            brew install "${packages[@]}"
         fi
-
-        if ! command_exists ffmpeg; then
-            log_info "Installing FFmpeg via apt..."
-            sudo apt-get install -y ffmpeg
-            log_ok "FFmpeg installed."
+        # Managed Python also needs Homebrew's headers when building PyAudio.
+        local portaudio_prefix
+        portaudio_prefix="$(brew --prefix portaudio)"
+        export CFLAGS="-I${portaudio_prefix}/include ${CFLAGS:-}"
+        export LDFLAGS="-L${portaudio_prefix}/lib ${LDFLAGS:-}"
+    elif command_exists apt-get && command_exists dpkg-query; then
+        local packages=() package status
+        for package in portaudio19-dev libsndfile1 ffmpeg build-essential pkg-config; do
+            status="$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)"
+            [[ "$status" == 'install ok installed' ]] || packages+=("$package")
+        done
+        if [[ ${#packages[@]} -gt 0 ]]; then
+            local privilege=()
+            if [[ "$EUID" -ne 0 ]]; then
+                command_exists sudo || fail "Ask an administrator to install: ${packages[*]}"
+                privilege=(sudo)
+            fi
+            "${privilege[@]}" apt-get update
+            "${privilege[@]}" apt-get install -y "${packages[@]}"
         fi
     else
-        log_info "Non-apt Linux detected. Please ensure PortAudio and FFmpeg are installed."
+        printf '%s\n' "Ensure PortAudio development headers, libsndfile, a C compiler and FFmpeg are installed (see README.md)."
     fi
-fi
+    command_exists ffmpeg || fail "FFmpeg is missing. Install it using your system package manager."
+    SYSTEM_DEPS_READY=true
+}
 
-if [[ ! -d "venv" ]]; then
-    log_info "Creating virtual environment..."
-    "$PYTHON_BIN" -m venv venv
+# Existing environments work without uv or a separately discoverable python3.12.
+if [[ -e venv || -L venv ]]; then
+    check_venv
 else
-    VENV_PYTHON_VERSION="$(venv/bin/python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || true)"
-    if [[ "$VENV_PYTHON_VERSION" != "3.12" ]]; then
-        log_err "ERROR: Existing venv uses Python ${VENV_PYTHON_VERSION:-unknown}; Python 3.12 is required."
-        echo "Move the existing venv aside and rerun setup:"
-        echo "  mv venv venv-backup"
-        echo "  ./run.sh --setup-only"
-        exit 1
+    UV_BIN="$(command -v uv || true)"
+    if [[ -z "$UV_BIN" && -x "${HOME}/.local/bin/uv" ]]; then
+        UV_BIN="${HOME}/.local/bin/uv"
     fi
+    [[ -n "$UV_BIN" ]] || command_exists python3.12 || fail "Install uv (https://docs.astral.sh/uv/getting-started/installation/) or Python 3.12, then rerun this command."
+    install_system_deps
+    printf '%s\n' 'Creating the Python 3.12 environment...'
+    if [[ -n "$UV_BIN" ]]; then
+        "$UV_BIN" venv --python 3.12 --managed-python --seed venv
+    else
+        python3.12 -m venv venv || fail "Python 3.12 needs venv support. On Ubuntu: sudo apt-get install python3.12-venv python3.12-dev. Alternatively install uv, move the incomplete venv aside, and retry."
+    fi
+    check_venv
 fi
 
-# shellcheck disable=SC1091
-source venv/bin/activate
-log_ok "Virtual environment ready."
-
-REQ_HASH_FILE="venv/.requirements.sha256"
-CURRENT_REQ_HASH="$(compute_sha256 requirements.txt)"
+REQ_HASH_FILE=venv/.requirements.sha256
+PREPARE_ASSETS=false
+CURRENT_REQ_HASH="$(venv/bin/python -c 'import hashlib; from pathlib import Path; print(hashlib.sha256(Path("requirements.txt").read_bytes()).hexdigest())')"
 SAVED_REQ_HASH=""
-if [[ -f "$REQ_HASH_FILE" ]]; then
-    SAVED_REQ_HASH="$(cat "$REQ_HASH_FILE")"
-fi
+[[ ! -f "$REQ_HASH_FILE" ]] || SAVED_REQ_HASH="$(cat "$REQ_HASH_FILE")"
 
-if [[ "$CURRENT_REQ_HASH" != "$SAVED_REQ_HASH" ]]; then
-    log_info "Installing/updating Python dependencies..."
-    python -m pip install --upgrade pip
-    python -m pip install -r requirements.txt
+if [[ "$CURRENT_REQ_HASH" != "$SAVED_REQ_HASH" || "$MODE" == setup-only ]]; then
+    install_system_deps
+    printf '%s\n' 'Installing Python dependencies...'
+    # A failed repair must not leave a stamp that makes the next launch skip it.
+    rm -f "$REQ_HASH_FILE"
+    if ! venv/bin/python -m pip --version >/dev/null 2>&1; then
+        venv/bin/python -m ensurepip --upgrade
+    fi
+    venv/bin/python -m pip install --upgrade pip
+    venv/bin/python -m pip install -r requirements.txt
+    venv/bin/python -m pip check
     printf '%s' "$CURRENT_REQ_HASH" > "$REQ_HASH_FILE"
-    log_ok "Dependencies installed."
-else
-    log_ok "Dependencies already up-to-date."
+    PREPARE_ASSETS=true
 fi
 
-if [[ "$SETUP_ONLY" == "true" ]]; then
-    log_info "Preparing offline wake-word model..."
-    python src/wake_word_model.py
-    log_ok "Setup complete."
-    exit 0
+if [[ "$MODE" == setup-only ]]; then
+    install_system_deps
+    exec venv/bin/python src/setup_assistant.py --prepare --config "$CONFIG_FILE"
 fi
 
-# Python parses .env without executing it and validates the selected --config.
-# Environment-only keys work without a .env file.
-if [[ ! -f ".env" && -f ".env.example" && -z "${OPENAI_API_KEY:-}" ]]; then
-    (umask 077; cp .env.example .env)
-    log_info "Created .env template; add OPENAI_API_KEY if it is not in your config."
+# A fresh install also prepares assets when launched without --setup-only.
+if [[ "$PREPARE_ASSETS" == true ]]; then
+    venv/bin/python src/setup_assistant.py --prepare --config "$CONFIG_FILE"
 fi
-
-log_ok "Starting Realtime Voice Assistant..."
-if [[ ${#ASSISTANT_ARGS[@]} -gt 0 ]]; then
-    exec python src/realtime_voice_assistant.py "${ASSISTANT_ARGS[@]}"
-else
-    exec python src/realtime_voice_assistant.py
-fi
+printf '%s\n' 'Starting the assistant. Press Ctrl+C to stop.'
+exec venv/bin/python src/realtime_voice_assistant.py --config "$CONFIG_FILE"

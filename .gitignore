@@ -2,6 +2,9 @@
 .env*
 !.env.example
 
+# Optional personal configuration used with --config
+/config/local.json
+
 # Python
 __pycache__/
 *.py[cod]

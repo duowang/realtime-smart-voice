@@ -19,26 +19,23 @@ Thank you for your interest in contributing! This project welcomes contributions
    cd realtime-smart-voice
    ```
 
-2. **Set up your environment:**
+2. **Install dependencies:**
+   Follow the [system prerequisites in README](README.md#1-install-prerequisites-once), then:
    ```bash
-   cp .env.example .env
-   # Add your OpenAI API key to .env
-   ```
-   
-   **Configure access:**
-   - **OpenAI**: Get Realtime API access at [platform.openai.com](https://platform.openai.com)
-   - **Wake word**: No account needed. Setup downloads the sherpa-onnx model once for offline detection.
-
-3. **Install dependencies:**
-   ```bash
-   ./run.sh --setup-only  # Requires Python 3.12; creates venv and installs dependencies
+   ./run.sh --setup-only  # Uses uv to install Python 3.12, or an existing Python 3.12
    make dev-deps
    ```
+   Setup creates a private `.env` template and downloads the wake model. It needs no API key and opens no audio devices. Existing settings are preserved.
 
-4. **Test the setup:**
+3. **Run the offline checks:**
    ```bash
-   ./run.sh  # Should start the assistant
+   make check
    ```
+   No OpenAI key is needed for the automated tests. Runner tests simulate package managers, Python creation, and failed installs without modifying the host.
+
+4. **Try a voice interaction:**
+   Add your OpenAI API key to `.env`, then run `./run.sh --doctor` and `./run.sh`.
+   Say “Hi Taco,” wait for the greeting, and ask a short question. Press Ctrl+C to stop.
 
 ## Making Changes
 

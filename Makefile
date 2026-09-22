@@ -1,10 +1,13 @@
-.PHONY: setup run dev-deps lint test check benchmark
+.PHONY: setup run doctor dev-deps lint test check benchmark
 
 setup:
 	./run.sh --setup-only
 
 run:
 	./run.sh
+
+doctor:
+	./run.sh --doctor
 
 dev-deps:
 	. venv/bin/activate && python -m pip install -r requirements-dev.txt
