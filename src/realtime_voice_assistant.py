@@ -38,7 +38,9 @@ class RealtimeVoiceAssistant:
         print("Initializing realtime voice assistant...")
         
         # Music command handler (shared across components)
-        self.music_handler = MusicCommandHandler(self._log_event)
+        self.music_handler = MusicCommandHandler(
+            self._log_event, music_volume=self.config.get("music_volume")
+        )
         
         # Wake word detector
         self.wake_word_detector = WakeWordDetector(self.config, self._log_event)
@@ -194,6 +196,8 @@ class RealtimeVoiceAssistant:
     async def handle_wake_word_detection(self):
         """Handle wake word detection and start realtime conversation"""
         try:
+            # Silence music immediately so the greeting and next command are audible.
+            await self.music_handler.pause_for_conversation()
             # Play acknowledgment
             await self.play_wake_word_acknowledgment()
             
@@ -206,6 +210,7 @@ class RealtimeVoiceAssistant:
         except Exception as e:
             print(f"Error handling wake word detection: {e}")
             self._log_event("CONVERSATION_ERROR", f"Failed to start conversation: {e}")
+            await self.realtime_client.stop_conversation()
     
     async def run_continuous_mode(self):
         """Run in continuous listening mode"""

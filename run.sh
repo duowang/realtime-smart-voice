@@ -173,6 +173,8 @@ else
 fi
 
 if [[ "$SETUP_ONLY" == "true" ]]; then
+    log_info "Preparing offline wake-word model..."
+    python src/wake_word_model.py
     log_ok "Setup complete."
     exit 0
 fi
@@ -183,7 +185,6 @@ if [[ ! -f ".env" && -f ".env.example" ]]; then
     echo
     log_info "Edit .env and add:"
     echo "  OPENAI_API_KEY=..."
-    echo "  PORCUPINE_ACCESS_KEY=..."
     echo
     log_err "Exiting until .env is configured."
     exit 1
@@ -204,49 +205,6 @@ if [[ -z "${OPENAI_API_KEY:-}" && "$OPENAI_IN_CONFIG" != "1" ]]; then
     echo "Add OPENAI_API_KEY to .env or set config/config.json: openai_api_key"
     echo "Get key from: https://platform.openai.com/api-keys"
     exit 1
-fi
-
-PORCUPINE_IN_CONFIG="$(config_has_nonempty_key porcupine_access_key)"
-if [[ -z "${PORCUPINE_ACCESS_KEY:-}" && "$PORCUPINE_IN_CONFIG" != "1" ]]; then
-    log_err "ERROR: Porcupine access key is required."
-    echo "Add PORCUPINE_ACCESS_KEY to .env or set config/config.json: porcupine_access_key"
-    echo "Get a free key from: https://console.picovoice.ai/"
-    exit 1
-fi
-
-# Check if Hi Taco wake word file exists (platform-specific)
-PLATFORM_SUFFIX=""
-if [[ "$OSTYPE" == "darwin"* ]]; then
-    if [[ "$(uname -m)" == "arm64" ]]; then
-        PLATFORM_SUFFIX="mac_apple"
-    else
-        PLATFORM_SUFFIX="mac"
-    fi
-elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
-    if [[ "$(uname -m)" =~ ^(arm|aarch64) ]]; then
-        PLATFORM_SUFFIX="raspberry-pi"
-    else
-        PLATFORM_SUFFIX="linux-x86_64"
-    fi
-else
-    PLATFORM_SUFFIX="raspberry-pi"  # fallback
-fi
-
-WAKE_WORD_FILES=(
-    "Hi-Taco_en_${PLATFORM_SUFFIX}_v4_0_0.ppn"
-)
-
-WAKE_WORD_FOUND=false
-for file in "${WAKE_WORD_FILES[@]}"; do
-    if [[ -f "$file" ]]; then
-        log_ok "Found wake word file: $file"
-        WAKE_WORD_FOUND=true
-        break
-    fi
-done
-
-if [[ "$WAKE_WORD_FOUND" == "false" ]]; then
-    log_info "No Porcupine 4 wake word file found. It will be generated on first start."
 fi
 
 echo -e "${GREEN}Starting Realtime Voice Assistant with YouTube Music support...${NC}"

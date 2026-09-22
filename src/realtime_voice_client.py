@@ -68,7 +68,9 @@ class RealtimeVoiceClient:
         self._init_audio()
         
         # Use provided music handler or create new one
-        self.music_handler = music_handler or MusicCommandHandler(log_function)
+        self.music_handler = music_handler or MusicCommandHandler(
+            log_function, music_volume=config.get("music_volume")
+        )
         
     def _setup_logging(self):
         """Setup logging for the realtime client"""
@@ -229,7 +231,10 @@ class RealtimeVoiceClient:
             
             self.websocket = await websockets.connect(
                 f"wss://api.openai.com/v1/realtime?model={model}",
-                additional_headers=headers
+                additional_headers=headers,
+                # Don't leave wake-word detection waiting through the default
+                # ten-second close handshake after music starts.
+                close_timeout=1,
             )
             
             session_config = self._build_session_config()
@@ -474,10 +479,6 @@ class RealtimeVoiceClient:
 
                     # If play succeeded, end conversation and return to wake word mode
                     if result.get("action") == "play" and result.get("success"):
-                        # Let the model acknowledge before ending
-                        await self.websocket.send(json.dumps({"type": "response.create"}))
-                        # Wait briefly for the acknowledgment audio to start
-                        # The conversation will end after silence timeout or next response.done
                         print("[Music started - will return to wake word detection mode]")
                         self.conversation_should_end = True
                         await self.stop_conversation()
@@ -658,6 +659,7 @@ class RealtimeVoiceClient:
     async def stop_conversation(self):
         """Stop the realtime conversation"""
         self.is_connected = False
+        self.conversation_should_end = True
         self.is_assistant_speaking = False
 
         if self.stream:
@@ -671,8 +673,8 @@ class RealtimeVoiceClient:
             self.output_stream = None
         
         if self.websocket:
-            await self.websocket.close()
-            self.websocket = None
+            websocket, self.websocket = self.websocket, None
+            await websocket.close()
         
         # Resume music if it was paused for conversation
         if self.music_handler:

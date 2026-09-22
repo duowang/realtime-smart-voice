@@ -1,7 +1,10 @@
+import asyncio
 import importlib
+import json
 import sys
 import types
 from pathlib import Path
+from unittest.mock import AsyncMock, Mock
 
 import numpy as np
 import pytest
@@ -34,3 +37,34 @@ def test_calculate_rms_handles_full_scale_pcm16_without_overflow():
 
 def test_calculate_rms_returns_zero_for_empty_audio():
     assert RealtimeVoiceClient._calculate_rms(b"") == 0.0
+
+
+def test_music_start_returns_to_wake_mode_without_requesting_more_speech():
+    client = object.__new__(RealtimeVoiceClient)
+    client.is_connected = True
+    client.conversation_should_end = False
+    client._log = Mock()
+    client.music_handler = Mock(execute=AsyncMock(return_value={"success": True, "action": "play"}))
+    client.stop_conversation = AsyncMock()
+    client.websocket = Mock(send=AsyncMock(), recv=AsyncMock(return_value=json.dumps({
+        "type": "response.function_call_arguments.done", "name": "play_music",
+        "arguments": '{"query":"test"}', "call_id": "test-call",
+    })))
+    asyncio.run(client._handle_responses())
+    assert client.conversation_should_end
+    client.stop_conversation.assert_awaited_once()
+    events = [json.loads(c.args[0]) for c in client.websocket.send.call_args_list]
+    assert [event["type"] for event in events] == ["conversation.item.create"]
+
+
+def test_realtime_connection_bounds_close_handshake(monkeypatch):
+    module = importlib.import_module("realtime_voice_client")
+    connect = AsyncMock(return_value=Mock(send=AsyncMock()))
+    monkeypatch.setattr(module.websockets, "connect", connect, raising=False)
+    client = object.__new__(RealtimeVoiceClient)
+    client.config = {}
+    client.api_key = "test-key"
+    client._build_session_config = Mock(return_value={})
+    client._log = Mock()
+    asyncio.run(client.initialize())
+    assert connect.call_args.kwargs["close_timeout"] == 1

@@ -8,9 +8,9 @@ from youtube_music_player import YouTubeMusicPlayer
 class MusicCommandHandler:
     """Handles music-related voice commands via LLM function calling"""
 
-    def __init__(self, log_function: Optional[Callable] = None):
+    def __init__(self, log_function: Optional[Callable] = None, music_volume: Optional[float] = None):
         self.log_function = log_function
-        self.music_player = YouTubeMusicPlayer(log_function)
+        self.music_player = YouTubeMusicPlayer(log_function, volume=music_volume)
     
     def _log(self, log_type: str, message: str):
         """Log message if logging function is available"""
@@ -107,13 +107,8 @@ class MusicCommandHandler:
                     'action': 'pause_no_music'
                 }
             
-            if status['is_paused']:
-                return {
-                    'success': False,
-                    'response': "The music is already paused.",
-                    'action': 'pause_already_paused'
-                }
-            
+            # A wake word temporarily pauses playback. An explicit pause must
+            # still reach the player to cancel its pending automatic resume.
             success = await self.music_player.pause()
             
             if success:

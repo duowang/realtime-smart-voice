@@ -22,8 +22,10 @@ from ytmusicapi import YTMusic
 
 class YouTubeMusicPlayer:
     """YouTube Music player for voice assistant"""
+
+    DEFAULT_VOLUME = 0.35
     
-    def __init__(self, log_function: Optional[Callable] = None):
+    def __init__(self, log_function: Optional[Callable] = None, volume: Optional[float] = None):
         """
         Initialize YouTube Music player
         
@@ -31,6 +33,10 @@ class YouTubeMusicPlayer:
             log_function: Optional logging function
         """
         self.log_function = log_function
+        self.volume = float(self.DEFAULT_VOLUME if volume is None else volume)
+        if not 0 <= self.volume <= 1:
+            raise ValueError("music_volume must be between 0 and 1")
+        self._playback_lock = threading.Lock()
         self.ytmusic = None
         self.current_song = None
         self.is_playing = False
@@ -484,24 +490,29 @@ class YouTubeMusicPlayer:
             self._log("MUSIC_PLAYBACK", f"Playing cached audio: {title}")
             
             # Load and play with pygame
-            pygame.mixer.music.load(audio_file)
-            pygame.mixer.music.play()
-            
-            # Monitor playback
-            while pygame.mixer.music.get_busy() and self.is_playing:
+            with self._playback_lock:
+                if not self.is_playing:
+                    return
+                pygame.mixer.music.load(audio_file)
+                # Loading a track resets pygame's volume to full scale.
+                pygame.mixer.music.set_volume(self.volume)
+                pygame.mixer.music.play()
                 if self.is_paused:
                     pygame.mixer.music.pause()
-                    while self.is_paused and self.is_playing:
-                        time.sleep(0.1)
-                    if self.is_playing:
-                        pygame.mixer.music.unpause()
-                
-                time.sleep(0.1)
             
-            if self.is_playing:
-                self._log("MUSIC_FINISHED", f"Finished playing: {title}")
-                self.is_playing = False
-                self.current_song = None
+            # Monitor playback
+            while True:
+                with self._playback_lock:
+                    if not self.is_playing:
+                        break
+                    # pygame reports not busy while paused. Keep the track
+                    # alive until it is resumed, stopped, or actually ends.
+                    if not self.is_paused and not pygame.mixer.music.get_busy():
+                        self._log("MUSIC_FINISHED", f"Finished playing: {title}")
+                        self.is_playing = False
+                        self.current_song = None
+                        break
+                time.sleep(0.1)
             
         except Exception as e:
             self._log("MUSIC_ERROR", f"Error in cached audio playback: {e}")
@@ -510,42 +521,52 @@ class YouTubeMusicPlayer:
     
     
     async def pause(self) -> bool:
-        """Pause current playback"""
-        if self.is_playing and not self.is_paused:
+        """Keep playback paused until an explicit resume, including after a conversation."""
+        with self._playback_lock:
+            if not self.is_playing:
+                return False
+            pygame.mixer.music.pause()
             self.is_paused = True
+            self.was_paused_for_conversation = False
             self._log("MUSIC_PAUSE", f"Paused: {self.current_song.get('title', 'Unknown') if self.current_song else 'Unknown'}")
             return True
-        return False
     
     async def resume(self) -> bool:
         """Resume paused playback"""
-        if self.is_playing and self.is_paused:
+        with self._playback_lock:
+            if not (self.is_playing and self.is_paused):
+                return False
+            pygame.mixer.music.unpause()
             self.is_paused = False
             self.was_paused_for_conversation = False  # Clear conversation pause flag
             self._log("MUSIC_RESUME", f"Resumed: {self.current_song.get('title', 'Unknown') if self.current_song else 'Unknown'}")
             return True
-        return False
     
     async def pause_for_conversation(self) -> bool:
         """Pause music for voice conversation"""
-        if self.is_playing and not self.is_paused:
+        with self._playback_lock:
+            if not (self.is_playing and not self.is_paused):
+                return False
+            pygame.mixer.music.pause()
             self.is_paused = True
             self.was_paused_for_conversation = True
             self._log("MUSIC_CONV_PAUSE", f"Paused for conversation: {self.current_song.get('title', 'Unknown') if self.current_song else 'Unknown'}")
             return True
-        return False
     
     async def resume_after_conversation(self) -> bool:
         """Resume music after voice conversation if it was paused for conversation"""
-        if self.is_playing and self.is_paused and self.was_paused_for_conversation:
+        with self._playback_lock:
+            if not (self.is_playing and self.is_paused and self.was_paused_for_conversation):
+                return False
+            pygame.mixer.music.unpause()
             self.is_paused = False
             self.was_paused_for_conversation = False
             self._log("MUSIC_CONV_RESUME", f"Resumed after conversation: {self.current_song.get('title', 'Unknown') if self.current_song else 'Unknown'}")
             return True
-        return False
     
     async def stop(self) -> bool:
         """Stop current playback"""
+        self.was_paused_for_conversation = False
         if self.is_playing:
             self.is_playing = False
             self.is_paused = False

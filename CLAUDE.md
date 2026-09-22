@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project Overview
 
 This is a real-time smart voice assistant that combines:
-- **Picovoice Porcupine** for wake word detection (offline, real-time)
+- **sherpa-onnx** for wake word detection (offline, real-time)
 - **OpenAI Realtime API** (GA) for natural voice conversations via direct WebSocket
 - **Asynchronous Architecture** for responsive, non-blocking audio processing
 
@@ -69,10 +69,10 @@ arecord -d 5 test.wav && aplay test.wav
    - Provides comprehensive logging and error handling
 
 2. **WakeWordDetector** (`wake_word_detector.py`) - Wake word detection
-   - Asynchronous Picovoice Porcupine integration
-   - Custom "Hi Taco" wake word with .ppn file
+   - Offline sherpa-onnx keyword spotting (no vendor account or key)
+   - Configurable English phrases, default "Hi Taco", encoded using the model pronunciation dictionary
    - PyAudio-based continuous audio monitoring
-   - Moderate sensitivity (0.6) to reduce false activations
+   - Configurable detection threshold (`wake_word_threshold`, default 0.25)
 
 3. **RealtimeVoiceClient** (`realtime_voice_client.py`) - Real-time conversation
    - Direct WebSocket connection to OpenAI Realtime API (GA)
@@ -95,7 +95,7 @@ arecord -d 5 test.wav && aplay test.wav
 
 ### Data Flow
 1. **Continuous Wake Word Monitoring**: Asynchronous audio monitoring for "Hi Taco"
-2. **Wake Word Detection**: Porcupine processes audio frames in real-time
+2. **Wake Word Detection**: sherpa-onnx processes 16 kHz PCM audio frames locally
 3. **Conversation Initialization**: WebSocket connection established to Realtime API
 4. **Real-time Audio Streaming**: Bidirectional audio with OpenAI Realtime API
 5. **Natural Conversation**: Low-latency back-and-forth interaction
@@ -104,14 +104,13 @@ arecord -d 5 test.wav && aplay test.wav
 ### Configuration System
 
 Main config: `config/config.json`
-- API keys (OpenAI Realtime API, Porcupine)
+- API key (OpenAI Realtime API)
 - Conversation timeout settings
 - Wake word configuration
 - Logging preferences
 
 Environment Variables (.env file):
 - `OPENAI_API_KEY` - Required for Realtime API access
-- `PORCUPINE_ACCESS_KEY` - Required for wake word detection
 Runtime timeouts are configured in `config/config.json`: `conversation_timeout` (120 seconds), `silence_timeout` (8 seconds), and `post_response_timeout` (6 seconds). Logging uses INFO level.
 
 The project supports `.env` files for secure API key management with automatic loading via python-dotenv.
@@ -119,8 +118,9 @@ The project supports `.env` files for secure API key management with automatic l
 ### Custom Wake Word
 
 Uses a custom "Hi Taco" wake word:
-- File: `Hi-Taco_en_<platform>_v4_0_0.ppn`, generated on first launch if missing
-- Moderate sensitivity (0.6) to reduce false activations
+- Model: pinned sherpa-onnx Zipformer, downloaded with SHA-256 verification and cached under `models/`
+- Phrases: `wake_keywords` in config; English words must exist in the model dictionary
+- Configurable detection threshold (`wake_word_threshold`, default 0.25)
 - Asynchronous processing to avoid blocking
 
 ### OpenAI Realtime API Integration
@@ -166,7 +166,7 @@ Built entirely on asyncio for maximum responsiveness:
 ### Performance Optimizations
 - **Minimal Buffer Delays**: Real-time audio processing
 - **Efficient Memory Usage**: Streaming instead of buffering large audio
-- **Fast Wake Word Detection**: High sensitivity Porcupine settings
+- **Fast Wake Word Detection**: Small quantized sherpa-onnx model on one CPU thread
 - **Async Everywhere**: Non-blocking operations throughout
 
 ## Development Guidelines
@@ -204,7 +204,7 @@ Maintain async/await throughout:
 ### Python Packages
 - `openai>=1.3.0`: OpenAI API client
 - `websockets>=12.0`: WebSocket connection to Realtime API
-- `pvporcupine>=4.0.0,<5.0.0`: Picovoice wake word detection
+- `sherpa-onnx>=1.13.8,<2.0.0`: Offline wake word detection
 - `pyaudio>=0.2.11`: Audio input/output
 - `numpy>=1.24.0`: Audio processing
 - `soundfile>=0.12.1`: Audio file reading

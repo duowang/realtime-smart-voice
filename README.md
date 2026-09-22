@@ -5,7 +5,7 @@ A voice assistant powered by OpenAI's Realtime API for direct audio-to-audio con
 ## Features
 
 - **Direct voice-to-voice** via OpenAI Realtime API over WebSocket
-- **Custom wake word** ("Hi Taco" default) via Picovoice Porcupine
+- **Offline wake word** ("Hi Taco" default) via sherpa-onnx, with no account or access key
 - **YouTube Music** playback with voice commands and smart local caching
 - **Album art** displayed in terminal during playback (ANSI true-color)
 - **Async architecture** — non-blocking audio throughout
@@ -37,24 +37,24 @@ Manual alternative:
 ```bash
 python3.12 -m venv venv && source venv/bin/activate
 python -m pip install -r requirements.txt
+python src/wake_word_model.py
 ```
 
-### 3. Configure API keys
+### 3. Configure the OpenAI API key
 
 ```bash
 cp .env.example .env
 # Edit .env and add:
 #   OPENAI_API_KEY=your_key_here
-#   PORCUPINE_ACCESS_KEY=your_key_here
 ```
 
-Get your keys from [OpenAI](https://platform.openai.com/api-keys) and [Picovoice Console](https://console.picovoice.ai/).
+Get your key from [OpenAI](https://platform.openai.com/api-keys). Wake-word detection needs no API key.
 
 ### 4. Set up wake word
 
-The runner uses Porcupine 4. On first launch, it generates a compatible **Hi Taco** model using your Picovoice access key. This requires internet access; the generated model is reused locally afterward.
+Setup downloads the pinned [sherpa-onnx keyword-spotting model](https://k2-fsa.github.io/sherpa/onnx/kws/pretrained_models/index.html) (`sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20`, approximately 33 MB download), verifies its SHA-256 checksum, and caches the required files under `models/`. The model files are excluded from Git.
 
-Alternatively, download a Porcupine 4 model for **Hi Taco** and your platform from [Picovoice Console](https://console.picovoice.ai/) and place it in the project root as `Hi-Taco_en_<platform>_v4_0_0.ppn`. Platform names include `mac_apple`, `mac`, `raspberry-pi`, and `linux-x86_64`. The legacy `v3_0_0` files are not used by the current runtime.
+After that download, wake-word detection runs locally without network access or a vendor account. OpenAI conversations and music searches still require internet access. No phrase training is needed; the model includes the pronunciation of **Hi Taco**.
 
 ### 5. Run
 
@@ -77,7 +77,9 @@ Alternatively, download a Porcupine 4 model for **Hi Taco** and your platform fr
 | Stop | "Stop music" |
 | Skip | "Next song", "Skip" |
 
-Music auto-pauses during conversation and resumes after. Songs and album art are cached locally in `music_cache/`.
+Say **"Hi Taco"** while music is playing, wait for the greeting, then say **"pause the music"**. Music pauses immediately on wake-up. It resumes after ordinary conversations, but an explicit pause keeps it paused until you request resume. Songs and album art are cached locally in `music_cache/`.
+
+Playback defaults to 35% volume so the microphone can hear the wake phrase over the speakers. Set `music_volume` in `config/config.json` between `0.0` and `1.0` to adjust it. Loud music can still mask speech; this application does not perform acoustic echo cancellation.
 
 ## Development Setup
 
@@ -106,11 +108,10 @@ make check
 
 ## Configuration
 
-Set API keys in `.env` (recommended):
+Set the API key in `.env` (recommended):
 
 ```
 OPENAI_API_KEY=...
-PORCUPINE_ACCESS_KEY=...
 ```
 
 Set runtime options in `config/config.json`. Conversation timeout defaults to 120 seconds, silence timeout to 8 seconds, and the pause after an assistant response to 6 seconds. Override these with `conversation_timeout`, `silence_timeout`, and `post_response_timeout`, respectively.
@@ -127,18 +128,29 @@ The default Realtime stack uses `gpt-realtime-2.1` with the `marin` voice. You c
 
 Set `"transcription_language"` to an ISO-639-1 code like `"en"` or `"zh"` if you want to force one language. Leave it as `null` to let the Realtime stack auto-detect multilingual speech.
 
-The current detector uses **Hi Taco**. Changing only `wake_keywords` in the configuration does not change the trained phrase; a different phrase also requires updating the detector's phrase/model selection and supplying a matching model.
+Configure English wake phrases and detection confidence in `config/config.json`:
+
+```json
+{
+  "wake_keywords": ["Hi Taco"],
+  "wake_word_threshold": 0.25
+}
+```
+
+Words must exist in the model's English pronunciation dictionary; startup reports unsupported words. Higher thresholds reduce false activations but may miss more wake words; lower thresholds increase sensitivity. Valid thresholds are greater than 0 and at most 1. An optional `wake_word_model_dir` selects a cache directory (relative paths resolve from the project root).
 
 ## Project Structure
 
 ```
 src/
   realtime_voice_assistant.py  # Main orchestrator
-  wake_word_detector.py        # Picovoice wake word detection
+  wake_word_detector.py        # Offline sherpa-onnx wake word detection
+  wake_word_model.py           # Pinned model download and cache
   realtime_voice_client.py     # OpenAI Realtime API (WebSocket)
   music_commands.py            # Music command handler
   youtube_music_player.py      # YouTube Music player, caching, thumbnail rendering
 config/config.json             # App configuration
+models/                        # Downloaded wake-word model (ignored by Git)
 music_cache/                   # Cached audio (*.mp3), thumbnails (*_thumb.jpg), metadata
 logs/                          # Application logs
 ```
@@ -155,9 +167,10 @@ python -c "import pyaudio; p = pyaudio.PyAudio(); [print(f'{i}: {p.get_device_in
 ```
 
 **Wake word not triggering:**
-- Verify the Porcupine 4 `.ppn` file is in the project root and matches your platform
-- If automatic model generation fails, check that your Picovoice key is active or download the model manually
-- Test your Picovoice key: `python -c "import pvporcupine; p = pvporcupine.create(access_key='YOUR_KEY', keywords=['computer']); print('OK'); p.delete()"`
+- Run `./run.sh --setup-only` to download any missing model files
+- Verify microphone permission and input level, then say the configured phrase clearly
+- Lower `wake_word_threshold` slightly if it misses phrases, or raise it if unrelated speech triggers it
+- If a download fails its checksum, rerun setup with a working connection; unverified files are not installed
 
 **Music not playing:**
 - Check internet connection (needed for YouTube Music search)

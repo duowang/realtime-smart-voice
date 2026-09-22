@@ -1,249 +1,165 @@
-import os
-import platform
+"""Offline wake-word detection using sherpa-onnx and the local microphone."""
+
+import logging
+import re
+import tempfile
 from pathlib import Path
 from typing import Callable, Optional
 
 import numpy as np
-import pvporcupine
 import pyaudio
+import sherpa_onnx
 
-PORCUPINE_MODEL_VERSION = "4_0_0"
-WAKE_WORD = "Hi Taco"
+from wake_word_model import DEFAULT_MODEL_DIR, PROJECT_ROOT, ensure_wake_word_model
 
-
-def _platform_suffix() -> str:
-    """Return the Picovoice filename suffix for the current platform."""
-    system = platform.system().lower()
-    machine = platform.machine().lower()
-    is_arm = "arm" in machine or "aarch64" in machine
-
-    if system == "darwin":
-        return "mac_apple" if is_arm else "mac"
-    if system == "linux":
-        return "raspberry-pi" if is_arm else "linux-x86_64"
-    if system == "windows":
-        return "windows-amd64"
-
-    raise RuntimeError(f"Unsupported wake-word platform: {system} ({machine})")
+SAMPLE_RATE = 16000
+FRAME_LENGTH = 512
+DEFAULT_THRESHOLD = 0.25
 
 
-def _compatible_keyword_path(access_key: str) -> Path:
-    """Return a Porcupine 4 keyword file, training it on first use if needed."""
-    project_root = Path(__file__).resolve().parent.parent
-    platform_suffix = _platform_suffix()
-    keyword_path = project_root / (
-        f"Hi-Taco_en_{platform_suffix}_v{PORCUPINE_MODEL_VERSION}.ppn"
-    )
+def encode_keywords(keywords: list[str], lexicon_path: Path) -> tuple[str, dict[str, str]]:
+    """Map English phrases to model phonemes and safe, unambiguous result labels."""
+    if not isinstance(keywords, list) or not keywords:
+        raise ValueError("wake_keywords must be a non-empty list of English phrases")
+    lexicon = {}
+    with lexicon_path.open(encoding="utf-8") as source:
+        for line in source:
+            parts = line.split()
+            if len(parts) > 1:
+                lexicon.setdefault(parts[0].upper(), parts[1:])
 
-    if keyword_path.exists():
-        return keyword_path
-
-    temporary_path = keyword_path.with_name(
-        f".{keyword_path.stem}.tmp{keyword_path.suffix}"
-    )
-    print(
-        f"No Porcupine 4 Hi Taco model found for {platform_suffix}; "
-        "generating one now..."
-    )
-
-    try:
-        temporary_path.unlink(missing_ok=True)
-        pvporcupine.train_wake_word_from_phrase(
-            access_key=access_key,
-            output_path=str(temporary_path),
-            language="en",
-            phrase=WAKE_WORD,
-        )
-        temporary_path.replace(keyword_path)
-    except Exception:
-        temporary_path.unlink(missing_ok=True)
-        raise RuntimeError(
-            "Could not generate a Porcupine 4 Hi Taco model. Update "
-            "PORCUPINE_ACCESS_KEY with an active key from "
-            "https://console.picovoice.ai/ and rerun ./run.sh, or download a "
-            f"Porcupine 4 model to {keyword_path}."
-        ) from None
-
-    print(f"Generated Porcupine 4 keyword file: {keyword_path.name}")
-    return keyword_path
+    encoded = []
+    labels = {}
+    for index, phrase in enumerate(keywords):
+        if not isinstance(phrase, str) or not re.fullmatch(
+            r"[A-Za-z]+(?:'[A-Za-z]+)*(?:\s+[A-Za-z]+(?:'[A-Za-z]+)*)*", phrase.strip()
+        ):
+            raise ValueError("wake_keywords must contain English words separated by spaces")
+        phrase = " ".join(phrase.split())
+        phones = []
+        for word in phrase.upper().split():
+            if word not in lexicon:
+                raise ValueError(
+                    f"Wake word '{word}' is not in the model's English pronunciation dictionary. "
+                    "Choose another phrase in config/config.json: wake_keywords."
+                )
+            phones.extend(lexicon[word])
+        label = f"wake_{index}"
+        labels[label] = phrase
+        encoded.append(f"{' '.join(phones)} @{label}")
+    return "\n".join(encoded), labels
 
 
 class WakeWordDetector:
-    """Handles wake word detection using Porcupine for realtime voice assistant"""
-    
+    """Keep the wake-word stream separate from the assistant's conversation audio."""
+
     def __init__(self, config: dict, log_function: Optional[Callable] = None):
-        """
-        Initialize wake word detector
-        
-        Args:
-            config: Configuration dictionary
-            log_function: Optional logging function that takes (log_type: str, message: str)
-        """
         self.config = config
         self.log_function = log_function
-        self.porcupine = None
-        self.wake_keywords = []
         self.audio = None
         self.stream = None
+        self.keyword_stream = None
         self.is_listening = False
-        
-        # Initialize Porcupine
-        self._init_porcupine()
-        
-        # Initialize PyAudio
-        self._init_audio()
-        
-    def _init_porcupine(self):
-        """Initialize Porcupine wake word detection"""
-        access_key = self.config.get("porcupine_access_key") or os.getenv("PORCUPINE_ACCESS_KEY")
-        
-        if not access_key:
-            error_msg = (
-                "ERROR: Porcupine access key is required for wake word detection.\n"
-                "Please get a free access key from: https://console.picovoice.ai/\n"
-                "Add it to config.json as 'porcupine_access_key' or set PORCUPINE_ACCESS_KEY environment variable."
-            )
-            print(error_msg)
-            raise RuntimeError("Porcupine access key is required. Cannot start wake word detector.")
-        
-        try:
-            custom_ppn_path = _compatible_keyword_path(access_key)
-            print(f"✓ Using Hi Taco keyword file: {custom_ppn_path.name}")
+        self.wake_keywords = config.get("wake_keywords", ["Hi Taco"])
 
-            keyword_paths = [str(custom_ppn_path)]
-            self.wake_keywords = [WAKE_WORD]
-            
-            # Initialize Porcupine with moderate sensitivity to reduce false positives during music playback
-            # Sensitivity: 0.0 (least sensitive) to 1.0 (most sensitive). 0.6 balances accuracy vs false positives
-            self.porcupine = pvporcupine.create(
-                access_key=access_key,
-                keyword_paths=keyword_paths,
-                sensitivities=[0.6] * len(keyword_paths)
+        threshold = float(config.get("wake_word_threshold", DEFAULT_THRESHOLD))
+        if not 0 < threshold <= 1:
+            raise ValueError("wake_word_threshold must be greater than 0 and at most 1")
+        model_dir = Path(config.get("wake_word_model_dir", DEFAULT_MODEL_DIR)).expanduser()
+        if not model_dir.is_absolute():
+            model_dir = PROJECT_ROOT / model_dir
+        paths = ensure_wake_word_model(model_dir)
+        self._keywords, self._keyword_labels = encode_keywords(self.wake_keywords, paths["lexicon"])
+        # sherpa reads this file during construction. A private temporary file
+        # lets concurrent assistants use different phrases without overwriting one another.
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", encoding="utf-8") as keywords:
+            keywords.write(self._keywords + "\n")
+            keywords.flush()
+            self.spotter = sherpa_onnx.KeywordSpotter(
+                tokens=str(paths["tokens"]),
+                encoder=str(paths["encoder"]),
+                decoder=str(paths["decoder"]),
+                joiner=str(paths["joiner"]),
+                keywords_file=keywords.name,
+                sample_rate=SAMPLE_RATE,
+                num_threads=1,
+                keywords_score=1.0,
+                keywords_threshold=threshold,
+                num_trailing_blanks=2,
+                provider="cpu",
             )
-            
-            print(f"Porcupine initialized with keywords: {self.wake_keywords}")
-            print(f"Sample rate: {self.porcupine.sample_rate}, frame length: {self.porcupine.frame_length}")
-            
-        except Exception as e:
-            print(f"Error initializing Porcupine: {e}")
-            raise RuntimeError(f"Porcupine initialization failed: {e}") from e
-    
-    def _init_audio(self):
-        """Initialize PyAudio for microphone input"""
         self.audio = pyaudio.PyAudio()
-        
+        self._log("WAKE_WORD_INIT", f"sherpa-onnx ready for {', '.join(self.wake_keywords)}")
+
     def _log(self, log_type: str, message: str):
-        """Log message if logging function is available"""
         if self.log_function:
-            try:
-                self.log_function(log_type, message)
-            except Exception as e:
-                print(f"Error logging wake word event: {e}")
+            self.log_function(log_type, message)
         else:
-            print(f"[{log_type}] {message}")
-    
+            logging.getLogger(__name__).info("[%s] %s", log_type, message)
+
     async def start_listening(self):
-        """Start continuous listening for wake words"""
         if self.is_listening:
             return
-            
-        try:
-            self.stream = self.audio.open(
-                format=pyaudio.paInt16,
-                channels=1,
-                rate=self.porcupine.sample_rate,
-                input=True,
-                frames_per_buffer=self.porcupine.frame_length
-            )
-            
-            self.is_listening = True
-            print(f"Started listening for wake word: {self.wake_keywords[0]}")
-            self._log("WAKE_WORD_START", "Started continuous wake word detection")
-            
-        except Exception as e:
-            print(f"Error starting wake word detection: {e}")
-            raise
-    
-    async def stop_listening(self):
-        """Stop listening for wake words"""
-        if not self.is_listening:
-            return
-            
-        self.is_listening = False
-        
-        if self.stream:
-            self.stream.stop_stream()
-            self.stream.close()
-            self.stream = None
-            
-        self._log("WAKE_WORD_STOP", "Stopped wake word detection")
-        print("Stopped wake word detection")
-    
+        # A fresh decoder stream prevents pre-conversation audio from triggering
+        # again when control returns from the Realtime client.
+        self.keyword_stream = self.spotter.create_stream()
+        self.stream = self.audio.open(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=SAMPLE_RATE,
+            input=True,
+            frames_per_buffer=FRAME_LENGTH,
+        )
+        self.is_listening = True
+        print(f"Started listening for wake word: {', '.join(self.wake_keywords)}")
+        self._log("WAKE_WORD_START", "Started offline wake-word detection")
+
+    def process_audio(self, audio_frame: bytes) -> Optional[str]:
+        """Feed PCM16 microphone audio to sherpa as normalized float32 samples."""
+        if self.keyword_stream is None:
+            self.keyword_stream = self.spotter.create_stream()
+        samples = np.frombuffer(audio_frame, dtype=np.int16).astype(np.float32) / 32768.0
+        self.keyword_stream.accept_waveform(SAMPLE_RATE, samples)
+        while self.spotter.is_ready(self.keyword_stream):
+            self.spotter.decode_stream(self.keyword_stream)
+            result = self.spotter.get_result(self.keyword_stream)
+            if result:
+                self.spotter.reset_stream(self.keyword_stream)
+                return self._keyword_labels[result]
+        return None
+
     async def listen_for_wake_word(self) -> Optional[str]:
-        """
-        Listen for wake word using Porcupine detection
-        
-        Returns:
-            str: Detected wake word, or None if no wake word detected
-        """
         if not self.is_listening:
             await self.start_listening()
-        
-        try:
-            # Read audio frame
-            audio_frame = self.stream.read(self.porcupine.frame_length, exception_on_overflow=False)
-            
-            # Convert to numpy array
-            pcm = np.frombuffer(audio_frame, dtype=np.int16)
-            
-            # Process with Porcupine
-            keyword_index = self.porcupine.process(pcm)
-            
-            if keyword_index >= 0:
-                detected_keyword = self.wake_keywords[keyword_index]
-                print(f"Wake word '{detected_keyword}' detected!")
-                self._log("WAKE_WORD_DETECTED", f"Porcupine detected: '{detected_keyword}'")
-                
-                # Stop listening after detection
-                await self.stop_listening()
-                
-                return detected_keyword
-            
-            return None
-            
-        except Exception as e:
-            error_msg = f"Porcupine detection failed: {e}"
-            print(f"Error in wake word detection: {e}")
-            self._log("WAKE_WORD_ERROR", error_msg)
-            return None
-    
+        audio_frame = self.stream.read(FRAME_LENGTH, exception_on_overflow=False)
+        keyword = self.process_audio(audio_frame)
+        if keyword:
+            self._log("WAKE_WORD_DETECTED", f"sherpa-onnx detected: '{keyword}'")
+            await self.stop_listening()
+        return keyword
+
+    def _close_stream(self):
+        self.is_listening = False
+        self.keyword_stream = None
+        stream, self.stream = self.stream, None
+        if stream is not None:
+            try:
+                stream.stop_stream()
+            finally:
+                stream.close()
+
+    async def stop_listening(self):
+        self._close_stream()
+
     def get_sample_rate(self) -> int:
-        """Get the sample rate used by Porcupine"""
-        return self.porcupine.sample_rate if self.porcupine else 16000
-    
+        return SAMPLE_RATE
+
     def cleanup(self):
-        """Clean up resources"""
-        if self.is_listening:
-            # Synchronous cleanup - stop listening directly
-            self.is_listening = False
-            if self.stream:
-                try:
-                    self.stream.stop_stream()
-                    self.stream.close()
-                    self.stream = None
-                except Exception as e:
-                    print(f"Error closing stream during cleanup: {e}")
-
-        if self.audio:
-            try:
+        try:
+            self._close_stream()
+        finally:
+            if self.audio is not None:
                 self.audio.terminate()
-            except Exception as e:
-                print(f"Error terminating audio during cleanup: {e}")
-
-        if self.porcupine:
-            try:
-                self.porcupine.delete()
-            except Exception as e:
-                print(f"Error deleting porcupine during cleanup: {e}")
-
-        print("Wake word detector cleaned up.")
+                self.audio = None
+            self.spotter = None
+        self._log("WAKE_WORD_STOP", "Wake-word detector cleaned up")

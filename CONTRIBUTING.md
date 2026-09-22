@@ -22,12 +22,12 @@ Thank you for your interest in contributing! This project welcomes contributions
 2. **Set up your environment:**
    ```bash
    cp .env.example .env
-   # Add your API keys to .env
+   # Add your OpenAI API key to .env
    ```
    
-   **Get your API keys:**
+   **Configure access:**
    - **OpenAI**: Get Realtime API access at [platform.openai.com](https://platform.openai.com)
-   - **Picovoice**: Sign up at [console.picovoice.ai](https://console.picovoice.ai) and create "Hi Taco" wake word for your platform
+   - **Wake word**: No account needed. Setup downloads the sherpa-onnx model once for offline detection.
 
 3. **Install dependencies:**
    ```bash
@@ -98,7 +98,7 @@ Update documentation for new configuration options
 
 ### macOS (Intel & Apple Silicon)
 - Test on both Intel and Apple Silicon if possible
-- Ensure correct .ppn file compatibility
+- Verify sherpa-onnx installation and model loading
 - Verify audio device handling
 
 ### Linux/Raspberry Pi
@@ -118,10 +118,10 @@ Update documentation for new configuration options
 - Respect rate limits and usage guidelines
 - Handle connection failures gracefully
 
-### Picovoice Porcupine
-- Custom wake word files are platform-specific
-- Test with both built-in and custom wake words
-- Handle authentication errors properly
+### sherpa-onnx Wake Words
+- Verify cached model startup without network access
+- Test configured phrases and unrelated speech for misses and false activations
+- Mock microphone and downloads in automated tests; keep model files and personal recordings out of Git
 
 ## Pull Request Process
 

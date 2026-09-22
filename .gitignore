@@ -65,6 +65,9 @@ test_audio.*
 Hi-Taco_en_*_v4_0_0.ppn
 .Hi-Taco_en_*.tmp.ppn
 
+# Downloaded offline wake-word models
+models/
+
 # Music cache (downloaded songs)
 music_cache/
 

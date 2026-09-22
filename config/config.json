@@ -11,6 +11,8 @@
   "tts_fallback": "pyttsx3",
   "tts_voice": "nova",
   "wake_keywords": ["Hi Taco"],
+  "wake_word_threshold": 0.25,
+  "music_volume": 0.35,
   "sample_rate": 16000,
   "chunk_size": 512,
   "silence_threshold": 0.01,
