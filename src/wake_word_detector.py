@@ -1,7 +1,6 @@
 """Offline wake-word detection using sherpa-onnx and the local microphone."""
 
 import logging
-import re
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
@@ -12,6 +11,7 @@ import sentencepiece as spm
 import sherpa_onnx
 
 from audio_io import audio_operation, close_stream
+from configuration import normalize_wake_phrase
 from wake_word_model import DEFAULT_MODEL_DIR, PROJECT_ROOT, ensure_wake_word_model
 
 SAMPLE_RATE = 16000
@@ -29,11 +29,7 @@ def encode_keywords(keywords: list[str], tokenizer_path: Path) -> tuple[str, dic
     encoded = []
     labels = {}
     for index, phrase in enumerate(keywords):
-        if not isinstance(phrase, str) or not re.fullmatch(
-            r"[A-Za-z]+(?:'[A-Za-z]+)*(?:\s+[A-Za-z]+(?:'[A-Za-z]+)*)*", phrase.strip()
-        ):
-            raise ValueError("wake_keywords must contain English words separated by spaces")
-        phrase = " ".join(phrase.split())
+        phrase = normalize_wake_phrase(phrase)
         pieces = tokenizer.encode(phrase.upper(), out_type=str)
         if not pieces or "<unk>" in pieces:
             raise ValueError(

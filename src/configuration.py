@@ -3,6 +3,7 @@
 import json
 import math
 import os
+import re
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -16,9 +17,25 @@ TIMEOUT_DEFAULTS = {
 }
 
 
-def load_config(path: str | Path = DEFAULT_CONFIG_FILE) -> dict:
+def default_config_path() -> Path:
+    """Prefer personal settings without changing the version-controlled defaults."""
+    local = PROJECT_ROOT / "config" / "local.json"
+    return local if local.exists() else DEFAULT_CONFIG_FILE
+
+
+def normalize_wake_phrase(phrase: str) -> str:
+    if not isinstance(phrase, str) or not re.fullmatch(
+        r"[A-Za-z]+(?:'[A-Za-z]+)*(?:\s+[A-Za-z]+(?:'[A-Za-z]+)*)*", phrase.strip()
+    ):
+        raise ValueError(
+            "Wake phrases must contain English words separated by spaces, for example 'Hey Nova'."
+        )
+    return " ".join(phrase.split())
+
+
+def load_config(path: str | Path | None = None) -> dict:
     """Fail clearly on malformed configuration instead of silently using defaults."""
-    path = Path(path).expanduser()
+    path = default_config_path() if path is None else Path(path).expanduser()
     try:
         config = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:

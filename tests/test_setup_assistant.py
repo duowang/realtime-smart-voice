@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 from unittest.mock import Mock
@@ -131,3 +132,108 @@ def test_invalid_config_fails_before_download_or_template_creation(installation,
     download.assert_not_called()
     assert not (root / ".env").exists()
     assert "OPENAI_API_KEY" not in os.environ
+
+
+@pytest.fixture
+def wake_settings(installation, monkeypatch):
+    import pyaudio
+    import requests
+
+    import wake_word_detector
+
+    root, config = installation
+    (root / "config").mkdir()
+    config.update(wake_keywords=["Hi Taco"], music_volume=0.2, custom_setting={"keep": True})
+    (root / "config/config.json").write_text(json.dumps(config))
+    model = Mock(return_value={"tokenizer": root / "models/custom/bpe.model"})
+    encode = Mock()
+    monkeypatch.setattr(wake_word_model, "ensure_wake_word_model", model)
+    monkeypatch.setattr(wake_word_detector, "encode_keywords", encode)
+    forbidden = Mock(side_effect=AssertionError("Wake settings must not use audio or an API"))
+    monkeypatch.setattr(pyaudio, "PyAudio", forbidden)
+    monkeypatch.setattr(requests, "get", forbidden)
+    return root, config, model, encode
+
+
+def test_wake_command_creates_personal_config_without_modifying_defaults(
+    wake_settings, monkeypatch, capsys
+):
+    root, config, model, encode = wake_settings
+    default = root / "config/config.json"
+    original = default.read_bytes()
+    monkeypatch.setattr(setup.sys, "argv", ["setup_assistant.py", "--wake-word", "  Hey   Nova "])
+    assert setup.main() == 0
+    saved = json.loads((root / "config/local.json").read_text())
+    assert saved == {**configuration.load_config(default), "wake_keywords": ["Hey Nova"]}
+    assert default.read_bytes() == original
+    assert not (root / ".env").exists()
+    model.assert_called_once_with(root / config["wake_word_model_dir"])
+    encode.assert_called_once_with(["Hey Nova"], model.return_value["tokenizer"])
+    assert "Next: ./run.sh." in capsys.readouterr().out
+
+
+def test_wake_command_preserves_existing_personal_settings(wake_settings):
+    root, config, _, _ = wake_settings
+    local = root / "config/local.json"
+    config.update(music_volume=0.15, wake_keywords=["Old", "Aliases"], openai_api_key="test-key")
+    local.write_text(json.dumps(config))
+    expected = {**configuration.load_config(local), "wake_keywords": ["Hi Taco"]}
+    assert setup.set_wake_word("Hi Taco") == 0
+    assert json.loads(local.read_text()) == expected
+
+
+def test_wake_command_updates_only_explicit_custom_config(wake_settings, capsys):
+    root, config, _, _ = wake_settings
+    custom = root / "config/my settings.json"
+    custom.write_text(json.dumps(config))
+    original = (root / "config/config.json").read_bytes()
+    assert setup.set_wake_word("Hey Nova", custom) == 0
+    assert json.loads(custom.read_text())["wake_keywords"] == ["Hey Nova"]
+    assert (root / "config/config.json").read_bytes() == original
+    assert not (root / "config/local.json").exists()
+    assert f"--config '{custom}'" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("phrase", ["", "123", "Hey/Nova", "你好"])
+def test_invalid_wake_phrase_does_not_download_or_change_settings(wake_settings, phrase):
+    root, _, model, encode = wake_settings
+    with pytest.raises(ValueError, match="English words"):
+        setup.set_wake_word(phrase)
+    model.assert_not_called()
+    encode.assert_not_called()
+    assert not (root / "config/local.json").exists()
+
+
+def test_unencodable_phrase_preserves_saved_settings(wake_settings):
+    root, config, _, encode = wake_settings
+    local = root / "config/local.json"
+    local.write_text(json.dumps(config))
+    original = local.read_bytes()
+    encode.side_effect = ValueError("Cannot tokenize wake phrase")
+    with pytest.raises(ValueError, match="Cannot tokenize"):
+        setup.set_wake_word("Hey Nova")
+    assert local.read_bytes() == original
+
+
+def test_failed_wake_settings_write_preserves_original_and_cleans_temp_file(
+    wake_settings, monkeypatch
+):
+    root, config, _, _ = wake_settings
+    local = root / "config/local.json"
+    local.write_text(json.dumps(config))
+    original = local.read_bytes()
+    monkeypatch.setattr(Path, "replace", Mock(side_effect=OSError("disk error")))
+    with pytest.raises(OSError, match="disk error"):
+        setup.set_wake_word("Hey Nova")
+    assert local.read_bytes() == original
+    assert not list(local.parent.glob(".wake-config-*"))
+
+
+def test_malformed_personal_settings_are_not_overwritten(wake_settings):
+    root, _, model, _ = wake_settings
+    local = root / "config/local.json"
+    local.write_text("broken json")
+    with pytest.raises(ValueError, match="Cannot read configuration"):
+        setup.set_wake_word("Hey Nova")
+    model.assert_not_called()
+    assert local.read_text() == "broken json"

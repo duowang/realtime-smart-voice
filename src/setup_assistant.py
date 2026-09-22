@@ -1,11 +1,13 @@
-"""Prepare local assets or diagnose an installation without opening audio devices."""
+"""Prepare assets, change the wake phrase, or check setup without opening audio."""
 
 import argparse
 import importlib
+import json
 import os
 import shlex
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -79,6 +81,7 @@ def key_configured(config: dict) -> bool:
 
 
 def prepare(config: dict, config_path: Path) -> int:
+    from configuration import default_config_path
     from wake_word_model import ensure_wake_word_model
 
     if not key_configured(config):
@@ -87,12 +90,53 @@ def prepare(config: dict, config_path: Path) -> int:
     ensure_wake_word_model(model_directory(config))
     print("Setup complete. No audio devices were opened.")
     command = "./run.sh"
-    if config_path.resolve() != PROJECT_ROOT / "config/config.json":
+    if config_path.resolve() != default_config_path().resolve():
         command += f" --config {shlex.quote(str(config_path))}"
     if key_configured(config):
         print(f"Next: {command}")
     else:
         print(f"Next: add your OpenAI API key to .env, then run {command}.")
+    return 0
+
+
+def set_wake_word(phrase: str, config_path: Path | None = None) -> int:
+    """Validate before atomically saving; never initialize the detector or audio."""
+    from configuration import load_config, normalize_wake_phrase
+    from wake_word_detector import encode_keywords
+    from wake_word_model import ensure_wake_word_model
+
+    phrase = normalize_wake_phrase(phrase)
+    target = (
+        config_path.expanduser() if config_path is not None else PROJECT_ROOT / "config/local.json"
+    )
+    source = (
+        target
+        if config_path is not None or target.exists()
+        else PROJECT_ROOT / "config/config.json"
+    )
+    config = load_config(source)
+    paths = ensure_wake_word_model(model_directory(config))
+    encode_keywords([phrase], paths["tokenizer"])
+    config["wake_keywords"] = [phrase]
+    # Write alongside the destination so a failed write cannot leave partial JSON.
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=target.parent, prefix=".wake-config-", delete=False
+        ) as output:
+            temporary = Path(output.name)
+            json.dump(config, output, indent=2, ensure_ascii=False)
+            output.write("\n")
+        temporary.replace(target)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    print(f'Wake phrase saved: "{phrase}" ({target})')
+    command = "./run.sh"
+    if config_path is not None:
+        command += f" --config {shlex.quote(str(config_path))}"
+    print(f"Next: {command}. If the assistant is running, stop it with Ctrl+C first.")
+    print("No training or calibration required. No audio devices were opened.")
     return 0
 
 
@@ -141,28 +185,38 @@ def diagnose(config: dict) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--prepare", action="store_true", help="Prepare .env and download missing model files"
     )
-    parser.add_argument("--config", type=Path, default=PROJECT_ROOT / "config/config.json")
+    mode.add_argument(
+        "--wake-word", metavar="PHRASE", help="Save a new English wake phrase and exit"
+    )
+    parser.add_argument(
+        "--config", type=Path, help="Use a specific JSON config instead of personal settings"
+    )
     args = parser.parse_args()
     if not report(
         sys.version_info[:2] == (3, 12), "Python 3.12", "Recreate venv with ./run.sh --setup-only."
     ):
         return 1
     try:
-        from configuration import load_config
+        from configuration import default_config_path, load_config
 
-        config = load_config(args.config)
-        report(True, f"Configuration: {args.config}")
+        if args.wake_word is not None:
+            return set_wake_word(args.wake_word, args.config)
+        config_path = args.config or default_config_path()
+        config = load_config(config_path)
+        report(True, f"Configuration: {config_path}")
         if args.prepare:
             if not check_dependencies():
                 return 1
-            return prepare(config, args.config)
+            return prepare(config, config_path)
         return diagnose(config)
     except (ImportError, OSError, ValueError, RuntimeError) as error:
         print(f"[FIX] {error}")
-        print("See README.md for setup instructions, then rerun ./run.sh --setup-only.")
+        if args.wake_word is None:
+            print("See README.md for setup instructions, then rerun ./run.sh --setup-only.")
         return 1
 
 

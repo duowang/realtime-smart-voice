@@ -64,9 +64,24 @@ When the terminal says **“Listening for Hi Taco”**, say **“Hi Taco”**, w
 
 For later launches, just run `./run.sh`. You do not need to activate the virtual environment. Normal launches reuse installed dependencies; `--setup-only` can also repair an installation. Run `./run.sh --help` for all options.
 
+### Choose your wake phrase
+
+To use a different English wake phrase, run:
+
+```bash
+./run.sh --wake-word "Hey Nova"
+./run.sh
+```
+
+The first command validates and saves the phrase, then exits without starting audio. It creates or updates the ignored `config/local.json`, preserving your other settings. Future launches, setup, and doctor checks use this file automatically. No OpenAI key, training, or calibration is needed to change the phrase. If the assistant is running, stop it with **Ctrl+C** before restarting.
+
+“Hey Nova” is an example; choose your own English words, using letters, spaces, and apostrophes. Test your phrase at normal speaking distance and while music plays. Keep the default sensitivity initially. To switch back, run `./run.sh --wake-word "Hi Taco"`.
+
+Using a separate config? Add `--config config/my-settings.json` to the command to update that existing file, and pass the same `--config` when starting the assistant.
+
 ## Try it
 
-Start each interaction with **“Hi Taco”** and wait for the greeting.
+Start each interaction with **“Hi Taco”** (or your chosen wake phrase) and wait for the greeting.
 
 | What you want | Say |
 | --- | --- |
@@ -104,19 +119,19 @@ git pull --ff-only
 ./run.sh
 ```
 
-Setup preserves your existing `.env`, downloaded music, and timers. If you use a custom config, pass the same `--config` to setup, doctor, and run. Git may ask you to resolve local changes to tracked files before updating; keep personal settings in a separate config as shown below.
+Setup preserves your existing `.env`, downloaded music, and timers. Personal settings in `config/local.json` are selected automatically. For other custom configs, pass the same `--config` to setup, doctor, and run. Git may ask you to resolve local changes to tracked files before updating; keep personal settings in a separate config as shown below.
 
 ## Configuration
 
-Defaults live in `config/config.json`. To keep personal settings separate from repository updates:
+Defaults live in `config/config.json`. The wake-phrase command above creates personal settings in `config/local.json`. To create this file manually if it does not already exist:
 
 ```bash
-cp config/config.json config/local.json
+cp -n config/config.json config/local.json
 # Edit config/local.json, then:
-./run.sh --config config/local.json
+./run.sh
 ```
 
-`config/local.json` is ignored by Git. Custom config paths passed to the runner are relative to the repository root, even when launching from another directory. For example:
+`config/local.json` is ignored by Git and used automatically when present, including by the direct Python entry point. `--config` always overrides this selection; `--config config/config.json` explicitly uses the repository defaults. Custom config paths passed to the runner are relative to the repository root, even when launching from another directory. For example:
 
 ```bash
 ./run.sh --setup-only --config config/local.json

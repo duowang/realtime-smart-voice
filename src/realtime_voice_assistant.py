@@ -14,7 +14,7 @@ import pyaudio
 import soundfile as sf
 
 from audio_io import audio_operation, close_stream
-from configuration import DEFAULT_CONFIG_FILE, PROJECT_ROOT, get_api_key, load_config
+from configuration import PROJECT_ROOT, get_api_key, load_config
 from music_commands import MusicCommandHandler
 from realtime_voice_client import RealtimeVoiceClient
 from timer_alerts import TimerAlerts
@@ -23,7 +23,7 @@ from wake_word_detector import WakeWordDetector
 
 
 class RealtimeVoiceAssistant:
-    def __init__(self, config_file: str | Path = DEFAULT_CONFIG_FILE):
+    def __init__(self, config_file: str | Path | None = None):
         self.config = load_config(config_file)
         get_api_key(self.config)  # Validate before downloading models or opening devices.
         self.running = False
@@ -263,7 +263,9 @@ class RealtimeVoiceAssistant:
 async def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--config", type=Path, default=DEFAULT_CONFIG_FILE, help="Configuration file"
+        "--config",
+        type=Path,
+        help="Configuration file (default: config/local.json if present, else config/config.json)",
     )
     args = parser.parse_args()
     try:

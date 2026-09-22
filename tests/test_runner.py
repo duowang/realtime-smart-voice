@@ -101,7 +101,19 @@ def test_help_without_installation_has_no_side_effects(sandbox):
     assert not (sandbox[0] / "venv").exists()
 
 
-@pytest.mark.parametrize("args", [("--config",), ("--typo",), ("--doctor", "--setup-only")])
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("--config",),
+        ("--typo",),
+        ("--doctor", "--setup-only"),
+        ("--wake-word",),
+        ("--wake-word", ""),
+        ("--wake-word", "Hey Nova", "--doctor"),
+        ("--setup-only", "--wake-word", "Hey Nova"),
+        ("--wake-word", "Hey", "Nova"),
+    ],
+)
 def test_bad_arguments_fail_before_installation(sandbox, args):
     assert run(sandbox, *args).returncode != 0
     assert calls(sandbox) == []
@@ -183,3 +195,50 @@ def test_failed_repair_removes_success_stamp(sandbox):
     assert run(sandbox, "--setup-only").returncode != 0
     assert not (sandbox[0] / "venv/.requirements.sha256").exists()
     assert not any("--prepare" in args for _, args in calls(sandbox))
+
+
+@pytest.mark.parametrize(
+    "args,entrypoint",
+    [
+        ((), "src/realtime_voice_assistant.py"),
+        (("--doctor",), "src/setup_assistant.py"),
+    ],
+)
+def test_local_config_is_used_automatically(sandbox, args, entrypoint):
+    existing_venv(sandbox)
+    (sandbox[0] / "config/local.json").write_text('{"wake_keywords": ["Hey Nova"]}')
+    assert run(sandbox, *args).returncode == 0
+    assert calls(sandbox)[-1] == ["python", [entrypoint, "--config", "config/local.json"]]
+
+
+def test_explicit_config_overrides_personal_config(sandbox):
+    existing_venv(sandbox)
+    (sandbox[0] / "config/local.json").write_text("{}")
+    assert run(sandbox, "--config=config/config.json").returncode == 0
+    assert calls(sandbox)[-1][1] == [
+        "src/realtime_voice_assistant.py",
+        "--config",
+        "config/config.json",
+    ]
+
+
+@pytest.mark.parametrize("custom", [False, True])
+def test_wake_word_command_saves_without_starting_assistant_or_preparing_env(sandbox, custom):
+    existing_venv(sandbox)
+    args = ["--wake-word", "Hey Nova"]
+    if custom:
+        (sandbox[0] / "config/my settings.json").write_text("{}")
+        args += ["--config", "config/my settings.json"]
+    assert run(sandbox, *args).returncode == 0
+    assert calls(sandbox)[-1] == ["python", ["src/setup_assistant.py", *args]]
+    assert not any(
+        "src/realtime_voice_assistant.py" in argv or "--prepare" in argv
+        for _, argv in calls(sandbox)
+    )
+
+
+def test_wake_word_command_can_bootstrap_a_fresh_installation(sandbox):
+    assert run(sandbox, "--wake-word", "Hey Nova").returncode == 0
+    assert (sandbox[0] / "venv/bin/python").exists()
+    assert calls(sandbox)[-1] == ["python", ["src/setup_assistant.py", "--wake-word", "Hey Nova"]]
+    assert not any("src/realtime_voice_assistant.py" in argv for _, argv in calls(sandbox))

@@ -7,13 +7,17 @@ cd "$SCRIPT_DIR"
 
 usage() {
     cat <<'HELP'
-Usage: ./run.sh [--setup-only | --doctor] [--config PATH]
+Usage: ./run.sh [--setup-only | --doctor | --wake-word "PHRASE"] [--config PATH]
 
-  (no option)     Set up if needed, then start listening for "Hi Taco".
+  (no option)     Set up if needed, then listen for your wake phrase ("Hi Taco" by default).
   --setup-only   Install dependencies, prepare the wake model and create .env.
                  Does not start audio or require an OpenAI API key.
   --doctor       Check this installation without downloads or audio devices.
+  --wake-word PHRASE
+                 Save a new English wake phrase and exit, e.g. --wake-word "Hey Nova".
+                 Uses config/local.json unless --config is specified. No API key needed.
   --config PATH  Use another JSON config (relative to the repository root).
+                 By default, use config/local.json if present, else config/config.json.
   -h, --help     Show this help without installing anything.
 
 First time: follow the system prerequisites in README.md, then:
@@ -28,20 +32,31 @@ command_exists() { command -v "$1" >/dev/null 2>&1; }
 
 MODE=run
 CONFIG_FILE=config/config.json
+[[ ! -e config/local.json ]] || CONFIG_FILE=config/local.json
+CONFIG_EXPLICIT=false
+WAKE_WORD=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help) usage; exit 0 ;;
         --setup-only|--doctor)
-            [[ "$MODE" == run ]] || fail "Choose either --setup-only or --doctor."
+            [[ "$MODE" == run ]] || fail "Choose only one of --setup-only, --doctor or --wake-word."
             MODE="${1#--}"
             shift
+            ;;
+        --wake-word)
+            [[ "$MODE" == run ]] || fail "Choose only one of --setup-only, --doctor or --wake-word."
+            [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || fail '--wake-word needs a phrase in quotes, e.g. --wake-word "Hey Nova".'
+            MODE=wake-word
+            WAKE_WORD="$2"
+            shift 2
             ;;
         --config)
             [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || fail "--config needs a file path."
             CONFIG_FILE="$2"
+            CONFIG_EXPLICIT=true
             shift 2
             ;;
-        --config=*) CONFIG_FILE="${1#--config=}"; shift ;;
+        --config=*) CONFIG_FILE="${1#--config=}"; CONFIG_EXPLICIT=true; shift ;;
         *) fail "Unknown option: $1. Run ./run.sh --help." ;;
     esac
 done
@@ -142,6 +157,13 @@ if [[ "$CURRENT_REQ_HASH" != "$SAVED_REQ_HASH" || "$MODE" == setup-only ]]; then
     venv/bin/python -m pip check
     printf '%s' "$CURRENT_REQ_HASH" > "$REQ_HASH_FILE"
     PREPARE_ASSETS=true
+fi
+
+if [[ "$MODE" == wake-word ]]; then
+    if [[ "$CONFIG_EXPLICIT" == true ]]; then
+        exec venv/bin/python src/setup_assistant.py --wake-word "$WAKE_WORD" --config "$CONFIG_FILE"
+    fi
+    exec venv/bin/python src/setup_assistant.py --wake-word "$WAKE_WORD"
 fi
 
 if [[ "$MODE" == setup-only ]]; then
