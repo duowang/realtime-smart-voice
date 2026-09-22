@@ -52,9 +52,9 @@ Get your key from [OpenAI](https://platform.openai.com/api-keys). Wake-word dete
 
 ### 4. Set up wake word
 
-Setup downloads the pinned [sherpa-onnx keyword-spotting model](https://k2-fsa.github.io/sherpa/onnx/kws/pretrained_models/index.html) (`sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20`, approximately 33 MB download), verifies its SHA-256 checksum, and caches the required files under `models/`. The model files are excluded from Git.
+Setup downloads the pinned [sherpa-onnx keyword-spotting model](https://k2-fsa.github.io/sherpa/onnx/kws/pretrained_models/index.html) (`sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01`, approximately 18 MB download), verifies its SHA-256 checksum, and caches the required files under `models/`. The model files are excluded from Git.
 
-After that download, wake-word detection runs locally without network access or a vendor account. OpenAI conversations and music searches still require internet access. No phrase training is needed; the model includes the pronunciation of **Hi Taco**.
+After that download, wake-word detection runs locally without network access or a vendor account. OpenAI conversations and music searches still require internet access. The wake-word model is English-only and uses its bundled SentencePiece tokenizer to encode **Hi Taco**; no phrase training is needed. Conversation language support is unchanged.
 
 ### 5. Run
 
@@ -133,11 +133,11 @@ Configure English wake phrases and detection confidence in `config/config.json`:
 ```json
 {
   "wake_keywords": ["Hi Taco"],
-  "wake_word_threshold": 0.25
+  "wake_word_threshold": 0.1
 }
 ```
 
-Words must exist in the model's English pronunciation dictionary; startup reports unsupported words. Higher thresholds reduce false activations but may miss more wake words; lower thresholds increase sensitivity. Valid thresholds are greater than 0 and at most 1. An optional `wake_word_model_dir` selects a cache directory (relative paths resolve from the project root).
+Wake phrases are tokenized with the English model’s bundled vocabulary, using letters, apostrophes, and spaces. Higher thresholds reduce false activations but may miss more wake words; lower thresholds increase sensitivity. Valid thresholds are greater than 0 and at most 1. An optional `wake_word_model_dir` selects a cache directory (relative paths resolve from the project root).
 
 ## Project Structure
 

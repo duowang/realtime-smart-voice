@@ -70,9 +70,9 @@ arecord -d 5 test.wav && aplay test.wav
 
 2. **WakeWordDetector** (`wake_word_detector.py`) - Wake word detection
    - Offline sherpa-onnx keyword spotting (no vendor account or key)
-   - Configurable English phrases, default "Hi Taco", encoded using the model pronunciation dictionary
+   - Configurable English phrases, default "Hi Taco", encoded using the model SentencePiece tokenizer
    - PyAudio-based continuous audio monitoring
-   - Configurable detection threshold (`wake_word_threshold`, default 0.25)
+   - Configurable detection threshold (`wake_word_threshold`, default 0.1)
 
 3. **RealtimeVoiceClient** (`realtime_voice_client.py`) - Real-time conversation
    - Direct WebSocket connection to OpenAI Realtime API (GA)
@@ -118,9 +118,9 @@ The project supports `.env` files for secure API key management with automatic l
 ### Custom Wake Word
 
 Uses a custom "Hi Taco" wake word:
-- Model: pinned sherpa-onnx Zipformer, downloaded with SHA-256 verification and cached under `models/`
-- Phrases: `wake_keywords` in config; English words must exist in the model dictionary
-- Configurable detection threshold (`wake_word_threshold`, default 0.25)
+- Model: pinned English-only sherpa-onnx GigaSpeech Zipformer, downloaded with SHA-256 verification and cached under `models/`
+- Phrases: `wake_keywords` in config; English phrases use the bundled SentencePiece tokenizer
+- Configurable detection threshold (`wake_word_threshold`, default 0.1)
 - Asynchronous processing to avoid blocking
 
 ### OpenAI Realtime API Integration
@@ -205,6 +205,7 @@ Maintain async/await throughout:
 - `openai>=1.3.0`: OpenAI API client
 - `websockets>=12.0`: WebSocket connection to Realtime API
 - `sherpa-onnx>=1.13.8,<2.0.0`: Offline wake word detection
+- `sentencepiece>=0.2.0,<0.3.0`: Matching English wake-word tokenizer
 - `pyaudio>=0.2.11`: Audio input/output
 - `numpy>=1.24.0`: Audio processing
 - `soundfile>=0.12.1`: Audio file reading

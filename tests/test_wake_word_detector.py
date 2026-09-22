@@ -29,22 +29,38 @@ def detector_module(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "sherpa_onnx", types.SimpleNamespace(
         KeywordSpotter=Mock(side_effect=create_spotter),
     ))
+    tokenizer = Mock()
+    tokenizer.encode.side_effect = lambda text, out_type: {
+        "HI TACO": ["▁HI", "▁TA", "CO"], "HELLO": ["▁HELLO"],
+    }.get(text, ["<unk>"])
+    monkeypatch.setitem(sys.modules, "sentencepiece", types.SimpleNamespace(
+        SentencePieceProcessor=Mock(return_value=tokenizer),
+    ))
     spec = importlib.util.spec_from_file_location("tested_wake_detector", SRC_DIR / "wake_word_detector.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    lexicon = tmp_path / "en.phone"
-    lexicon.write_text("HI HH AY1\nTACO T AA1 K OW0\nHELLO HH AH0 L OW1\n")
+    tokenizer_path = tmp_path / "bpe.model"
     paths = {name: tmp_path / name for name in ("encoder", "decoder", "joiner", "tokens")}
-    paths["lexicon"] = lexicon
+    paths["tokenizer"] = tokenizer_path
     monkeypatch.setattr(module, "ensure_wake_word_model", Mock(return_value=paths))
-    return module, audio, spotter, keyword_files, lexicon
+    return module, audio, spotter, keyword_files, tokenizer
 
 
-def test_phrases_use_model_pronunciations_and_safe_result_labels(detector_module):
-    module, _, _, files, _ = detector_module
+def test_phrases_use_model_tokenizer_and_safe_result_labels(detector_module):
+    module, _, _, files, tokenizer = detector_module
     detector = module.WakeWordDetector({"wake_keywords": ["  Hi   Taco ", "Hello"]})
-    assert files == ["HH AY1 T AA1 K OW0 @wake_0\nHH AH0 L OW1 @wake_1\n"]
+    assert files == ["▁HI ▁TA CO @wake_0\n▁HELLO @wake_1\n"]
+    assert [c.args[0] for c in tokenizer.encode.call_args_list] == ["HI TACO", "HELLO"]
     assert detector._keyword_labels == {"wake_0": "Hi Taco", "wake_1": "Hello"}
+
+
+def test_incomplete_tokenization_is_rejected_before_native_initialization(detector_module):
+    module, _, _, _, tokenizer = detector_module
+    tokenizer.encode.side_effect = None
+    tokenizer.encode.return_value = []
+    with pytest.raises(ValueError, match="Cannot tokenize"):
+        module.WakeWordDetector({})
+    module.sherpa_onnx.KeywordSpotter.assert_not_called()
 
 
 @pytest.mark.parametrize("phrases", [[], "Hi Taco", ["Hi/Taco"], ["Unknown"], [123]])

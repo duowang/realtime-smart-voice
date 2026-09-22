@@ -10,19 +10,19 @@ from pathlib import Path
 import requests
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-MODEL_NAME = "sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20"
+MODEL_NAME = "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01"
 MODEL_URL = (
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/"
     f"{MODEL_NAME}.tar.bz2"
 )
-MODEL_SHA256 = "68447f4fbc67e70eee3a93961f36e81e98f47aef73ce7e7ca00885c6cd3616a6"
+MODEL_SHA256 = "f170013b4716e41b62b9bfd809687c207cef798ef9bc6534d524e17af9b6561a"
 DEFAULT_MODEL_DIR = PROJECT_ROOT / "models" / MODEL_NAME
 MODEL_FILES = {
-    "encoder": "encoder-epoch-13-avg-2-chunk-16-left-64.int8.onnx",
-    "decoder": "decoder-epoch-13-avg-2-chunk-16-left-64.onnx",
-    "joiner": "joiner-epoch-13-avg-2-chunk-16-left-64.int8.onnx",
+    "encoder": "encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
+    "decoder": "decoder-epoch-12-avg-2-chunk-16-left-64.onnx",
+    "joiner": "joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
     "tokens": "tokens.txt",
-    "lexicon": "en.phone",
+    "tokenizer": "bpe.model",
 }
 
 

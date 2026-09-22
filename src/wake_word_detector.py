@@ -8,25 +8,22 @@ from typing import Callable, Optional
 
 import numpy as np
 import pyaudio
+import sentencepiece as spm
 import sherpa_onnx
 
 from wake_word_model import DEFAULT_MODEL_DIR, PROJECT_ROOT, ensure_wake_word_model
 
 SAMPLE_RATE = 16000
 FRAME_LENGTH = 512
-DEFAULT_THRESHOLD = 0.25
+DEFAULT_THRESHOLD = 0.1
+MAX_ACTIVE_PATHS = 8
 
 
-def encode_keywords(keywords: list[str], lexicon_path: Path) -> tuple[str, dict[str, str]]:
-    """Map English phrases to model phonemes and safe, unambiguous result labels."""
+def encode_keywords(keywords: list[str], tokenizer_path: Path) -> tuple[str, dict[str, str]]:
+    """Encode English phrases with the exact subword vocabulary used by the model."""
     if not isinstance(keywords, list) or not keywords:
         raise ValueError("wake_keywords must be a non-empty list of English phrases")
-    lexicon = {}
-    with lexicon_path.open(encoding="utf-8") as source:
-        for line in source:
-            parts = line.split()
-            if len(parts) > 1:
-                lexicon.setdefault(parts[0].upper(), parts[1:])
+    tokenizer = spm.SentencePieceProcessor(model_file=str(tokenizer_path))
 
     encoded = []
     labels = {}
@@ -36,17 +33,12 @@ def encode_keywords(keywords: list[str], lexicon_path: Path) -> tuple[str, dict[
         ):
             raise ValueError("wake_keywords must contain English words separated by spaces")
         phrase = " ".join(phrase.split())
-        phones = []
-        for word in phrase.upper().split():
-            if word not in lexicon:
-                raise ValueError(
-                    f"Wake word '{word}' is not in the model's English pronunciation dictionary. "
-                    "Choose another phrase in config/config.json: wake_keywords."
-                )
-            phones.extend(lexicon[word])
+        pieces = tokenizer.encode(phrase.upper(), out_type=str)
+        if not pieces or "<unk>" in pieces:
+            raise ValueError(f"Cannot tokenize wake phrase '{phrase}'; choose another English phrase")
         label = f"wake_{index}"
         labels[label] = phrase
-        encoded.append(f"{' '.join(phones)} @{label}")
+        encoded.append(f"{' '.join(pieces)} @{label}")
     return "\n".join(encoded), labels
 
 
@@ -69,7 +61,7 @@ class WakeWordDetector:
         if not model_dir.is_absolute():
             model_dir = PROJECT_ROOT / model_dir
         paths = ensure_wake_word_model(model_dir)
-        self._keywords, self._keyword_labels = encode_keywords(self.wake_keywords, paths["lexicon"])
+        self._keywords, self._keyword_labels = encode_keywords(self.wake_keywords, paths["tokenizer"])
         # sherpa reads this file during construction. A private temporary file
         # lets concurrent assistants use different phrases without overwriting one another.
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", encoding="utf-8") as keywords:
@@ -85,7 +77,9 @@ class WakeWordDetector:
                 num_threads=1,
                 keywords_score=1.0,
                 keywords_threshold=threshold,
-                num_trailing_blanks=2,
+                # Keep alternate token paths alive for accented/connected speech.
+                max_active_paths=MAX_ACTIVE_PATHS,
+                num_trailing_blanks=1,
                 provider="cpu",
             )
         self.audio = pyaudio.PyAudio()
