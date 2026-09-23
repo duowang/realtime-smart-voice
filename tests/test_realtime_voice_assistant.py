@@ -21,9 +21,9 @@ def assistant():
     result.timer_service = Mock(close=AsyncMock())
     result.timer_alerts = Mock()
     result._pending_timer_alerts = {}
-    result._playing_prompt = False
+    result._playing_cue = False
     result.music_handler = Mock(pause_for_conversation=AsyncMock(), aclose=AsyncMock())
-    result.play_wake_word_acknowledgment = AsyncMock()
+    result.play_wake_cue = AsyncMock()
     result.realtime_client = Mock(
         start_conversation=AsyncMock(), stop_conversation=AsyncMock(), cleanup=AsyncMock()
     )
@@ -39,14 +39,20 @@ def test_default_config_path_is_independent_of_working_directory(tmp_path, monke
     assert load_config()["realtime_model"] == "gpt-realtime-2.1"
 
 
-def test_music_pauses_before_wake_greeting_and_conversation(assistant):
+def test_wake_cue_waits_for_session_setup(assistant):
     events = []
     assistant.timer_alerts.hush.side_effect = lambda: events.append("hush")
-    assistant.music_handler.pause_for_conversation.side_effect = lambda: events.append("pause")
-    assistant.play_wake_word_acknowledgment.side_effect = lambda: events.append("greeting")
-    assistant.realtime_client.start_conversation.side_effect = lambda: events.append("conversation")
+    assistant.play_wake_cue.side_effect = lambda: events.append("cue")
+
+    async def start_conversation(*, on_ready):
+        events.append("session ready")
+        await on_ready()
+        events.append("conversation")
+
+    assistant.realtime_client.start_conversation.side_effect = start_conversation
     asyncio.run(assistant.handle_wake_word_detection())
-    assert events == ["hush", "pause", "greeting", "conversation"]
+    assert events == ["hush", "session ready", "cue", "conversation"]
+    assistant.music_handler.pause_for_conversation.assert_not_awaited()
 
 
 def test_failed_conversation_restores_music(assistant):
@@ -73,7 +79,7 @@ def test_assistant_log_boundary_omits_music_content_and_redacts_errors(assistant
 def test_timeout_covers_the_active_conversation(assistant):
     cancelled = []
 
-    async def forever():
+    async def forever(**_kwargs):
         try:
             await asyncio.Future()
         finally:
@@ -86,19 +92,23 @@ def test_timeout_covers_the_active_conversation(assistant):
     assistant.realtime_client.stop_conversation.assert_awaited_once()
 
 
-def test_failed_greeting_write_releases_every_resource(assistant, monkeypatch):
+def test_wake_cue_is_short_and_bounded():
+    samples = np.frombuffer(module.wake_cue_pcm(), dtype=np.float32)
+    assert 0.15 <= len(samples) / module.WAKE_CUE_RATE <= 0.2
+    assert 0 < np.max(np.abs(samples)) <= module.WAKE_CUE_VOLUME
+    assert samples[0] == samples[-1] == 0
+
+
+def test_failed_wake_cue_write_releases_every_resource(assistant, monkeypatch):
     audio = Mock()
     audio.open.return_value.write.side_effect = OSError("speaker unplugged")
     monkeypatch.setattr(module.pyaudio, "PyAudio", Mock(return_value=audio))
-    monkeypatch.setattr(
-        module.sf, "read", Mock(return_value=(np.zeros((4, 1), dtype=np.float32), 24000))
-    )
-    asyncio.run(assistant._play_audio_file("unused.wav", "greeting", "GREETING"))
+    asyncio.run(RealtimeVoiceAssistant.play_wake_cue(assistant))
     audio.open.return_value.close.assert_called_once()
     audio.terminate.assert_called_once()
 
 
-def test_greeting_drain_keeps_loop_responsive_and_finishes_before_termination(
+def test_wake_cue_drain_keeps_loop_responsive_and_finishes_before_termination(
     assistant, monkeypatch
 ):
     entered, release = threading.Event(), threading.Event()
@@ -110,17 +120,13 @@ def test_greeting_drain_keeps_loop_responsive_and_finishes_before_termination(
 
     audio.open.return_value.stop_stream.side_effect = drain
     monkeypatch.setattr(module.pyaudio, "PyAudio", Mock(return_value=audio))
-    monkeypatch.setattr(
-        module.sf, "read", Mock(return_value=(np.zeros((4, 1), dtype=np.float32), 24000))
-    )
-
     async def run():
-        task = asyncio.create_task(assistant._play_audio_file("unused.wav", "hi", "HI"))
+        task = asyncio.create_task(RealtimeVoiceAssistant.play_wake_cue(assistant))
         try:
             async with asyncio.timeout(1):
                 while not entered.is_set():
                     await asyncio.sleep(0)
-            assert assistant._playing_prompt
+            assert assistant._playing_cue
             for _ in range(2):
                 task.cancel()
                 await asyncio.sleep(0)
@@ -130,7 +136,7 @@ def test_greeting_drain_keeps_loop_responsive_and_finishes_before_termination(
             release.set()
         with pytest.raises(asyncio.CancelledError):
             await task
-        assert not assistant._playing_prompt
+        assert not assistant._playing_cue
         audio.open.return_value.close.assert_called_once()
         audio.terminate.assert_called_once()
 

@@ -35,7 +35,7 @@ Thank you for your interest in contributing! This project welcomes contributions
 
 4. **Try a voice interaction:**
    Add your OpenAI API key to `.env`, then run `./run.sh --doctor` and `./run.sh`.
-   Say “Hi Taco,” wait for the greeting, and ask a short question. Press Ctrl+C to stop.
+   Say “Hi Taco,” wait for the short wake cue, and ask a short question. Press Ctrl+C to stop.
 
 ## Making Changes
 

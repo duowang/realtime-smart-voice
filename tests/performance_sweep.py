@@ -20,7 +20,6 @@ from unittest.mock import Mock, patch
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from configuration import PROJECT_ROOT  # noqa: E402
 from realtime_voice_assistant import RealtimeVoiceAssistant  # noqa: E402
 from timers import HISTORY_LIMIT, TimerService  # noqa: E402
 from youtube_music_player import YouTubeMusicPlayer  # noqa: E402
@@ -55,12 +54,12 @@ async def measure(directory: Path) -> dict:
     assistant = object.__new__(RealtimeVoiceAssistant)
     assistant.timer_alerts = Mock()
     assistant._log_event = Mock()
-    prompt_times = []
+    cue_times = []
     with patch("realtime_voice_assistant.pyaudio.PyAudio", return_value=Mock()):
         for _ in range(5):
             start = time.perf_counter()
-            await assistant._play_audio_file(PROJECT_ROOT / "audio/hi_there.wav", "hi", "HI")
-            prompt_times.append((time.perf_counter() - start) * 1000)
+            await assistant.play_wake_cue()
+            cue_times.append((time.perf_counter() - start) * 1000)
     assistant._log_event.assert_not_called()
 
     play_times, result_times = [], []
@@ -94,7 +93,7 @@ async def measure(directory: Path) -> dict:
     return {
         "timer_poll_100_history_us": round(statistics.median(poll_times), 2),
         "idle_timer_ticks_in_1_1_seconds": idle_ticks,
-        "greeting_overhead_ms": round(statistics.median(prompt_times), 2),
+        "wake_cue_overhead_ms": round(statistics.median(cue_times), 2),
         "cached_music_start_with_200ms_art_ms": round(statistics.median(play_times), 2),
         "cached_music_result_with_200ms_art_ms": round(statistics.median(result_times), 2),
     }

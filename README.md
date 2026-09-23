@@ -60,7 +60,7 @@ Then run:
 
 On macOS, allow microphone access for the terminal application when prompted. Choose your microphone and output device in the operating system's sound settings.
 
-When the terminal says **“Listening for Hi Taco”**, say **“Hi Taco”**, wait for the greeting, then ask a question or give a command. Press **Ctrl+C** to stop the application.
+When the terminal says **“Listening for Hi Taco”**, say **“Hi Taco”**, wait for the short two-note cue, then ask a question or give a command. The cue only confirms that the assistant heard the wake phrase; spoken replies use the configured Realtime voice. Press **Ctrl+C** to stop the application.
 
 For later launches, just run `./run.sh`. You do not need to activate the virtual environment. Normal launches reuse installed dependencies; `--setup-only` can also repair an installation. Run `./run.sh --help` for all options.
 
@@ -81,7 +81,7 @@ Using a separate config? Add `--config config/my-settings.json` to the command t
 
 ## Try it
 
-Start each interaction with **“Hi Taco”** (or your chosen wake phrase) and wait for the greeting.
+Start each interaction with **“Hi Taco”** (or your chosen wake phrase) and wait for the short cue. The assistant does not play a separate goodbye clip when it returns to wake mode.
 
 | What you want | Say |
 | --- | --- |
@@ -171,7 +171,7 @@ See [SECURITY.md](SECURITY.md) to report vulnerabilities privately, and the [sec
 
 ## Troubleshooting
 
-Start with `./run.sh --doctor`. It checks Python, imports, FFmpeg, prompt files, the selected wake-model cache, and whether a key is configured. It makes no network requests and opens no audio devices; a configured key still needs valid OpenAI access.
+Start with `./run.sh --doctor`. It checks Python, imports, FFmpeg, the selected wake-model cache, and whether a key is configured. It makes no network requests and opens no audio devices; a configured key still needs valid OpenAI access.
 
 | Problem | What to do |
 | --- | --- |
@@ -198,7 +198,7 @@ make check
 make benchmark
 ```
 
-`make check` compiles code, runs Ruff, and runs the offline pytest suite with audio and network boundaries mocked. GitHub Actions runs the same checks on Python 3.12. `make benchmark` measures local timer, greeting, and music-start overhead without devices or an API key. See the [performance results](docs/performance-sweep.md) and [code review](docs/code-review.md).
+`make check` compiles code, runs Ruff, and runs the offline pytest suite with audio and network boundaries mocked. GitHub Actions runs the same checks on Python 3.12. `make benchmark` measures local timer, wake-cue, and music-start overhead without devices or an API key. See the [performance results](docs/performance-sweep.md) and [code review](docs/code-review.md).
 
 For an optional **live headless test**, provide mono PCM16 recordings: a 16 kHz wake phrase and 24 kHz `play.wav`, `pause.wav`, `resume.wav`, and `stop.wav` files. This sends the command audio to OpenAI, searches YouTube Music, and uses silent SDL output. It needs the normal API key and can incur API usage.
 
@@ -211,6 +211,6 @@ venv/bin/python tests/headless_smoke.py \
 
 Add `--background-audio /path/to/music-16k.wav --snr-db 5` to test wake detection in a digital music mix. This verifies controls and cleanup, but does not reproduce physical room acoustics. Keep recordings and reports outside Git.
 
-Runtime code lives in `src/`; configuration in `config/`; prompt audio in `audio/`. The runner and `src/setup_assistant.py` handle installation checks. Generated `venv/`, `models/`, `music_cache/`, `data/`, and logs stay local.
+Runtime code lives in `src/`, with configuration in `config/`. The wake cue is generated locally and needs no audio asset. The runner and `src/setup_assistant.py` handle installation checks. Generated `venv/`, `models/`, `music_cache/`, `data/`, and logs stay local.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development guidance. Licensed under the [MIT License](LICENSE).

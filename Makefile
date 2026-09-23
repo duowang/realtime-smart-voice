@@ -17,16 +17,16 @@ security-deps:
 
 audit:
 	venv/bin/python -m pip_audit --progress-spinner off
-	venv/bin/python -m bandit -r src generate_audio.py -ll
+	venv/bin/python -m bandit -r src -ll
 
 lint:
-	. venv/bin/activate && ruff check src tests generate_audio.py
+	. venv/bin/activate && ruff check src tests
 
 test:
 	. venv/bin/activate && pytest
 
 check:
-	. venv/bin/activate && python -m compileall -q src tests generate_audio.py && ruff check src tests generate_audio.py && pytest
+	. venv/bin/activate && python -m compileall -q src tests && ruff check src tests && pytest
 
 benchmark:
 	venv/bin/python tests/performance_sweep.py --output tmp/performance-sweep/current.json

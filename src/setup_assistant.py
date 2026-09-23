@@ -15,7 +15,6 @@ DEPENDENCIES = (
     "dotenv",
     "pyaudio",
     "numpy",
-    "soundfile",
     "sherpa_onnx",
     "sentencepiece",
     "websockets",
@@ -151,15 +150,6 @@ def diagnose(config: dict) -> int:
             "Install FFmpeg using your system package manager.",
         )
     )
-    for name in ("hi_there.wav", "bye_bye.wav"):
-        path = PROJECT_ROOT / "audio" / name
-        checks.append(
-            report(
-                path.is_file() and path.stat().st_size > 0,
-                f"Prompt: {name}",
-                "Restore the audio/ files from the repository.",
-            )
-        )
     model = model_directory(config)
     complete = all(
         (model / name).is_file() and (model / name).stat().st_size > 0

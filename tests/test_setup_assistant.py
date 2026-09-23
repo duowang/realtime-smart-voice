@@ -16,10 +16,6 @@ def installation(tmp_path, monkeypatch):
     monkeypatch.setattr(configuration, "PROJECT_ROOT", tmp_path)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     (tmp_path / ".env.example").write_text("OPENAI_API_KEY=your_openai_api_key_here\n")
-    for name in ("hi_there.wav", "bye_bye.wav"):
-        path = tmp_path / "audio" / name
-        path.parent.mkdir(exist_ok=True)
-        path.write_bytes(b"prompt")
     model = tmp_path / "models" / "custom"
     model.mkdir(parents=True)
     for name in wake_word_model.MODEL_FILES.values():
@@ -96,16 +92,15 @@ def test_doctor_is_offline_and_does_not_create_env_or_open_devices(
     forbidden.assert_not_called()
 
 
-def test_doctor_reports_missing_assets_and_ffmpeg(installation, monkeypatch, capsys):
+def test_doctor_reports_missing_model_and_ffmpeg(installation, monkeypatch, capsys):
     root, config = installation
     monkeypatch.setenv("OPENAI_API_KEY", "private-test-key")
     monkeypatch.setattr(setup.shutil, "which", lambda _: None)
     monkeypatch.setattr(setup, "check_dependencies", lambda: True)
-    (root / "audio/hi_there.wav").unlink()
     (root / "models/custom" / next(iter(wake_word_model.MODEL_FILES.values()))).write_bytes(b"")
     assert setup.diagnose(config) == 1
     output = capsys.readouterr().out
-    assert output.count("[FIX]") == 3
+    assert output.count("[FIX]") == 2
     assert "[FIX] Wake model" in output
     assert "private-test-key" not in output
 

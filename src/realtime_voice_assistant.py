@@ -10,7 +10,6 @@ from pathlib import Path
 
 import numpy as np
 import pyaudio
-import soundfile as sf
 
 from audio_io import audio_operation, close_stream
 from configuration import PROJECT_ROOT, get_api_key, load_config
@@ -20,6 +19,27 @@ from realtime_voice_client import RealtimeVoiceClient
 from timer_alerts import TimerAlerts
 from timers import TimerService
 from wake_word_detector import WakeWordDetector
+
+WAKE_CUE_RATE = 24000
+WAKE_CUE_NOTE_SECONDS = 0.07
+WAKE_CUE_GAP_SECONDS = 0.02
+WAKE_CUE_VOLUME = 0.12
+
+
+def wake_cue_pcm() -> bytes:
+    """A quiet, click-free acknowledgment that does not imitate the assistant's voice."""
+    sample_count = round(WAKE_CUE_RATE * WAKE_CUE_NOTE_SECONDS)
+    phase = np.arange(sample_count, dtype=np.float32) / WAKE_CUE_RATE
+    envelope = np.sin(np.pi * np.arange(sample_count) / sample_count) ** 2
+    envelope[-1] = 0
+    notes = [
+        (WAKE_CUE_VOLUME * envelope * np.sin(2 * np.pi * frequency * phase)).astype(
+            np.float32
+        )
+        for frequency in (523.25, 659.25)
+    ]
+    gap = np.zeros(round(WAKE_CUE_RATE * WAKE_CUE_GAP_SECONDS), dtype=np.float32)
+    return np.concatenate((notes[0], gap, notes[1])).tobytes()
 
 
 class RealtimeVoiceAssistant:
@@ -35,7 +55,7 @@ class RealtimeVoiceAssistant:
         self.timer_service = None
         self.timer_alerts = None
         self._pending_timer_alerts = {}
-        self._playing_prompt = False
+        self._playing_cue = False
         self._setup_logging()
         try:
             self.music_handler = MusicCommandHandler(
@@ -82,10 +102,10 @@ class RealtimeVoiceAssistant:
     def _tick_timer_alerts(self) -> bool:
         self.timer_alerts.update()
         client = self.realtime_client
-        # Don't compete with a speaking user, streamed response, or greeting.
+        # Don't compete with a speaking user, streamed response, or wake cue.
         if (
             self._shutting_down
-            or self._playing_prompt
+            or self._playing_cue
             or (
                 client is not None
                 and client.is_connected
@@ -150,66 +170,46 @@ class RealtimeVoiceAssistant:
             ),
         )
 
-    async def _play_audio_file(self, path: str | Path, description: str, log_prefix: str) -> None:
+    async def play_wake_cue(self) -> None:
         audio = stream = None
-        self._playing_prompt = True
+        self._playing_cue = True
         try:
             self.timer_alerts.hush()
-            data, rate = sf.read(path, dtype="float32", always_2d=True)
-            if not data.size:
-                raise ValueError("Audio prompt is empty")
-            peak = float(np.max(np.abs(data)))
-            if peak > 1:
-                data /= peak
             audio = pyaudio.PyAudio()
             stream = audio.open(
                 format=pyaudio.paFloat32,
-                channels=data.shape[1],
-                rate=int(rate),
+                channels=1,
+                rate=WAKE_CUE_RATE,
                 output=True,
                 frames_per_buffer=1024,
             )
-            for offset in range(0, len(data), 1024):
-                await audio_operation(stream.write, data[offset : offset + 1024].tobytes())
+            await audio_operation(stream.write, wake_cue_pcm())
         except Exception as error:
-            self._log_event(f"{log_prefix}_ERROR", f"Cannot play {description}: {error}")
+            self._log_event("WAKE_CUE_ERROR", f"Cannot play wake cue: {error}")
         finally:
             try:
                 # stop_stream drains PortAudio's pending output. No extra sleep
                 # is needed, and draining must not block other event-loop work.
                 await audio_operation(close_stream, stream)
             finally:
-                self._playing_prompt = False
+                self._playing_cue = False
                 if audio is not None:
                     audio.terminate()
 
-    async def play_wake_word_acknowledgment(self) -> None:
-        await self._play_audio_file(
-            PROJECT_ROOT / "audio" / "hi_there.wav", "greeting", "WAKE_WORD_ACK"
-        )
-
-    async def play_bye_bye_sound(self) -> None:
-        if not self.music_handler.get_status()["is_playing"]:
-            await self._play_audio_file(
-                PROJECT_ROOT / "audio" / "bye_bye.wav", "goodbye", "BYE_BYE"
-            )
-
     async def handle_wake_word_detection(self) -> None:
-        self._hush_timer_alerts()  # Local, before greeting or cloud connection.
+        self._hush_timer_alerts()  # Local, before cue or cloud connection.
         try:
-            # Cover greeting, connection setup, tool work, and the conversation.
+            # Cover cue, connection setup, tool work, and the conversation.
             async with asyncio.timeout(self.config.get("conversation_timeout", 120)):
-                await self.music_handler.pause_for_conversation()
-                await self.play_wake_word_acknowledgment()
                 self._log_event("CONVERSATION_START", "Starting conversation after wake word")
-                await self.realtime_client.start_conversation()
+                await self.realtime_client.start_conversation(on_ready=self.play_wake_cue)
         except TimeoutError:
             self._log_event("CONVERSATION_TIMEOUT", "Returning to wake-word detection")
         except Exception as error:
             self._log_event("CONVERSATION_ERROR", str(error))
             print(f"Conversation failed: {safe_text(error, secret=self._api_key)}")
         finally:
-            # Also restores an automatic pause when greeting/connection setup fails.
+            # Also restores an automatic pause when cue/connection setup fails.
             await self.realtime_client.stop_conversation(resume_music=not self._shutting_down)
 
     async def run_continuous_mode(self) -> None:
@@ -236,7 +236,6 @@ class RealtimeVoiceAssistant:
                 keyword = await self.wake_word_detector.listen_for_wake_word()
                 if keyword:
                     await self.handle_wake_word_detection()
-                    await self.play_bye_bye_sound()
                     print("Ready for next wake word.")
         except asyncio.CancelledError:
             if not self._shutting_down:

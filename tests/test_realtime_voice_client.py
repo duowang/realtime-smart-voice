@@ -41,6 +41,39 @@ def test_realtime_connection_waits_for_configuration(client, monkeypatch):
     module.pyaudio.PyAudio.assert_not_called()
 
 
+def test_ready_cue_follows_session_setup_and_precedes_microphone(client, monkeypatch):
+    socket_for(client, monkeypatch, [{"type": "session.updated"}])
+    events = []
+    client.music_handler.pause_for_conversation.side_effect = lambda: events.append("pause")
+
+    def log_event(kind, _message):
+        if kind == "REALTIME_INIT":
+            events.append("configured")
+
+    client.log_function = log_event
+    audio = module.pyaudio.PyAudio.return_value
+    stream = audio.open.return_value
+
+    def open_microphone(**_kwargs):
+        events.append("microphone")
+        return stream
+
+    audio.open.side_effect = open_microphone
+
+    async def cue():
+        events.append("cue")
+
+    async def run():
+        owner = asyncio.create_task(client.start_conversation(on_ready=cue))
+        while not client.is_connected:
+            await asyncio.sleep(0)
+        await client.stop_conversation()
+        assert owner.done()
+
+    asyncio.run(run())
+    assert events[:4] == ["pause", "configured", "cue", "microphone"]
+
+
 def test_invalid_server_session_closes_socket_without_opening_mic(client, monkeypatch):
     socket = socket_for(
         client, monkeypatch, [{"type": "error", "error": {"message": "bad config"}}]

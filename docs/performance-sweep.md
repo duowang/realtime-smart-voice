@@ -7,8 +7,8 @@ sizes, OpenAI model, or conversational behavior.
 ## Measurements
 
 `tests/performance_sweep.py` uses five samples per measurement and reports medians.
-Timer samples each perform 1,000 polls with 100 completed history records. Greeting
-samples decode the real prompt into a mock device. Music samples use a cached-file
+Timer samples each perform 1,000 polls with 100 completed history records. The
+original greeting samples decoded a WAV prompt into a mock device. Music samples use a cached-file
 placeholder, a mock mixer, and a simulated 200 ms artwork fetch. No network or
 physical audio device is used. The idle scheduler is observed separately for 1.1 s.
 
@@ -26,6 +26,11 @@ with machine load. The substantive changes remove a fixed delay and a network
 dependency from the critical path, and eliminate periodic timer work while idle.
 `cProfile` identified deep copying as the dominant CPU work in the original timer
 benchmark; the scheduler no longer copies unchanged history.
+
+The prerecorded greeting was subsequently replaced by a locally generated
+two-note wake cue, and the goodbye clip was removed. The current benchmark uses
+`wake_cue_overhead_ms`; on the same machine it measured **0.59 ms** excluding
+device playback. The greeting numbers above remain the historical comparison.
 
 ## Changes and invariants
 

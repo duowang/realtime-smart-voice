@@ -7,6 +7,7 @@ import logging
 import re
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from urllib.parse import quote
 
 import pyaudio
@@ -283,7 +284,9 @@ class RealtimeVoiceClient:
                     break
         self._log("REALTIME_INIT", "Realtime session configured")
 
-    async def start_conversation(self) -> None:
+    async def start_conversation(
+        self, on_ready: Callable[[], Awaitable[None]] | None = None
+    ) -> None:
         """Own every worker until completion, failure, timeout, or cancellation.
 
         A worker ending unexpectedly ends the whole session; siblings are always
@@ -302,6 +305,8 @@ class RealtimeVoiceClient:
         try:
             await self.music_handler.pause_for_conversation()
             await self.initialize()
+            if on_ready is not None:
+                await on_ready()
             self._init_audio()
             self.stream = self.audio.open(
                 format=pyaudio.paInt16,
