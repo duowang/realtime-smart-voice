@@ -2,8 +2,6 @@
   "openai_api_key": null,
   "realtime_model": "gpt-realtime-2.1",
   "realtime_voice": "marin",
-  "transcription_model": "gpt-4o-mini-transcribe",
-  "transcription_language": null,
   "wake_keywords": [
     "Hi Taco"
   ],

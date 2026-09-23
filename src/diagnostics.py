@@ -5,13 +5,11 @@ import re
 from logging.handlers import RotatingFileHandler
 
 CONTENT_EVENTS = {
-    "USER_TRANSCRIPT",
     "ASSISTANT_RESPONSE",
     "FUNCTION_CALL",
     "MUSIC_FUNCTION_CALL",
     "MUSIC_SEARCH",
     "MUSIC_PLAYBACK",
-    "CONVERSATION_END_DETECTED",
 }
 KEY_PATTERN = re.compile(r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{16,}")
 

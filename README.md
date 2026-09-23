@@ -81,7 +81,7 @@ Using a separate config? Add `--config config/my-settings.json` to the command t
 
 ## Try it
 
-Start each interaction with **“Hi Taco”** (or your chosen wake phrase) and wait for the short cue. The assistant does not play a separate goodbye clip when it returns to wake mode.
+Start each interaction with **“Hi Taco”** (or your chosen wake phrase) and wait for the short cue. Say **“goodbye”** to return silently to wake mode, or let the conversation end after a short pause. The terminal prints when wake listening resumes.
 
 | What you want | Say |
 | --- | --- |
@@ -147,12 +147,10 @@ cp -n config/config.json config/local.json
 | `wake_keywords` | `["Hi Taco"]` | English wake phrases; no phrase training needed |
 | `wake_word_threshold` | `0.1` | Higher values reduce false wakes but may miss more speech; range `(0, 1]` |
 | `wake_word_input_boost` | `4.0` | Also check a boosted microphone signal for quiet wake phrases; use `1` to disable, range `[1, 8]` |
-| `log_conversation_content` | `false` | Opt in to saving transcripts and tool arguments in local logs |
+| `log_conversation_content` | `false` | Opt in to saving assistant responses and tool arguments in local logs |
 | `music_volume` | `0.35` | Playback volume, from 0 to 1 |
 | `realtime_model` | `gpt-realtime-2.1` | OpenAI Realtime model |
 | `realtime_voice` | `marin` | Assistant voice |
-| `transcription_model` | `gpt-4o-mini-transcribe` | Input transcription model |
-| `transcription_language` | `null` | Automatic detection; use `en` or `zh` to specify a language |
 | `conversation_timeout` | `120` | Maximum conversation duration, in seconds |
 | `silence_timeout` | `8` | User silence timeout, in seconds |
 | `post_response_timeout` | `6` | Wait after a completed response, in seconds |
@@ -168,7 +166,7 @@ The English [sherpa-onnx keyword model](https://k2-fsa.github.io/sherpa/onnx/kws
 
 Wake detection runs locally. After waking, microphone audio is sent to OpenAI for the conversation, including nearby speech that the microphone picks up. A wake phrase does **not** identify who is speaking: other people or recordings can activate it. Press **Ctrl+C** to stop listening. Timers need the app running and the computer awake; use an independent system for critical deadlines.
 
-Conversation transcripts, responses, and tool arguments are omitted from logs by default. `log_conversation_content: true` enables local content logging for debugging. Logs are restricted to your OS account, but old log contents are not erased by an update. Review logs before sharing them. Timer labels and music history remain in ignored `data/` and `music_cache/` folders. Keep your API key in `.env` and private settings in `config/local.json`.
+The app does not request separate transcription of your speech. Assistant responses and tool arguments are omitted from logs by default; `log_conversation_content: true` enables those local details for debugging. Logs are restricted to your OS account, but old log contents are not erased by an update. Review logs before sharing them. Timer labels and music history remain in ignored `data/` and `music_cache/` folders. Keep your API key in `.env` and private settings in `config/local.json`.
 
 See [SECURITY.md](SECURITY.md) to report vulnerabilities privately, and the [security review](docs/security-review.md) for scope and remaining limitations. Maintainers can run `make security-deps` followed by `make audit` to check dependencies and Python code. Keep system audio libraries and FFmpeg updated through your package manager as well.
 

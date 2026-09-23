@@ -16,7 +16,7 @@ def test_conversation_and_tool_content_are_omitted_by_default():
 def test_keys_and_terminal_controls_are_removed_even_when_content_logging_is_enabled():
     key = "sk-proj-" + "a" * 30
     text = f"\x1b]52;c;clipboard\x07\n{key}\rsecret-test-key\x9b31m\u202esecret"
-    result = log_message("USER_TRANSCRIPT", text, include_content=True, secret="secret-test-key")
+    result = log_message("ASSISTANT_RESPONSE", text, include_content=True, secret="secret-test-key")
     assert key not in result and "secret-test-key" not in result
     assert result.count("[REDACTED]") == 2
     assert all(c.isprintable() for c in result)

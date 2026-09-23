@@ -85,31 +85,10 @@ def test_invalid_server_session_closes_socket_without_opening_mic(client, monkey
     client.music_handler.resume_after_conversation.assert_awaited_once()
 
 
-@pytest.mark.parametrize(
-    "text",
-    [
-        "Stop the music.",
-        "Stop playing.",
-        "Stop.",
-        "Please play Bye Bye Bye.",
-        "Pause the music, thanks.",
-        "I'm not finished with my question.",
-    ],
-)
-def test_music_commands_and_mentions_do_not_end_conversation(client, text):
-    assert not client._should_end_conversation(text)
-
-
-@pytest.mark.parametrize(
-    "text", ["Goodbye!", "Thank you.", "Okay, that's all.", "Please end conversation."]
-)
-def test_standalone_farewells_still_end_conversation(client, text):
-    assert client._should_end_conversation(text)
-
-
-def test_stop_without_music_ends_conversation(client):
-    client.music_handler.get_status.return_value = {"is_playing": False}
-    assert client._should_end_conversation("Stop.")
+def test_session_uses_direct_audio_and_exposes_explicit_end_tool(client):
+    session = client._build_session_config()["session"]
+    assert "transcription" not in session["audio"]["input"]
+    assert "end_conversation" in {tool["name"] for tool in session["tools"]}
 
 
 def tool_response(name, arguments="{}"):
@@ -129,18 +108,12 @@ def tool_response(name, arguments="{}"):
     }
 
 
-def test_stop_music_transcript_reaches_function_handler_once(client):
+def test_stop_music_tool_reaches_function_handler_once(client):
     client.log_function = Mock()
     client.websocket = Mock(send=AsyncMock())
     client.music_handler.execute = AsyncMock(return_value={"success": True, "action": "stop"})
 
     async def run():
-        await client._handle_event(
-            {
-                "type": "conversation.item.input_audio_transcription.completed",
-                "transcript": "Stop the music.",
-            }
-        )
         # The earlier arguments event must not trigger a duplicate execution or response.
         await client._handle_event(
             {"type": "response.function_call_arguments.done", "name": "stop_music"}
@@ -154,6 +127,60 @@ def test_stop_music_transcript_reaches_function_handler_once(client):
     assert not client.conversation_should_end
     sent = [json.loads(call.args[0])["type"] for call in client.websocket.send.call_args_list]
     assert sent == ["conversation.item.create", "response.create"]
+
+
+def test_end_conversation_tool_returns_to_wake_without_followup(client):
+    client.websocket = Mock(send=AsyncMock())
+    client.music_handler.execute = AsyncMock()
+
+    asyncio.run(client._handle_event(tool_response("end_conversation")))
+
+    assert client.conversation_should_end
+    assert client._stop_event.is_set()
+    client.music_handler.execute.assert_not_awaited()
+    sent = [json.loads(call.args[0]) for call in client.websocket.send.call_args_list]
+    assert [event["type"] for event in sent] == ["conversation.item.create"]
+    assert sent[0]["item"]["output"] == '{"success": true, "action": "end_conversation"}'
+
+
+def test_end_conversation_waits_for_queued_farewell_audio(client):
+    client.websocket = Mock(send=AsyncMock())
+
+    async def run():
+        client._output_queue.put_nowait((0, "farewell", 0, b"\0" * 960))
+        ending = asyncio.create_task(client._handle_event(tool_response("end_conversation")))
+        await asyncio.sleep(0)
+        assert not ending.done()
+        assert not client.conversation_should_end
+        client._output_queue.get_nowait()
+        client._output_queue.task_done()
+        await asyncio.wait_for(ending, 1)
+
+    asyncio.run(run())
+    assert client.conversation_should_end
+
+
+def test_timer_confirmation_precedes_simultaneous_goodbye(client, monkeypatch):
+    monkeypatch.setattr(module, "MICROPHONE_PLAYBACK_GUARD_SECONDS", 0)
+    client.timer_service = Mock(execute=AsyncMock(return_value={"success": True}))
+    client.websocket = Mock(send=AsyncMock())
+    event = tool_response("create_timer", '{"duration_seconds":60}')
+    event["response"]["output"].append(
+        {"type": "function_call", "name": "end_conversation", "arguments": "{}", "call_id": "end"}
+    )
+
+    async def run():
+        await client._handle_event(event)
+        sent = [json.loads(call.args[0]) for call in client.websocket.send.call_args_list]
+        assert [item["type"] for item in sent] == [
+            "conversation.item.create", "conversation.item.create", "response.create"
+        ]
+        assert sent[-1]["response"]["tool_choice"] == "none"
+        assert not client.conversation_should_end
+        await client._handle_event({"type": "response.done", "response": {"status": "completed"}})
+        assert client.conversation_should_end
+
+    asyncio.run(run())
 
 
 def test_music_start_returns_to_wake_mode_without_more_speech(client):
@@ -172,15 +199,13 @@ def test_invalid_function_json_cannot_silently_execute_stop(client):
     client.music_handler.execute.assert_awaited_once_with("stop_music", None)
 
 
-def test_client_omits_transcripts_and_arguments_from_logs_unless_enabled(client):
+def test_client_omits_tool_arguments_from_logs_unless_enabled(client):
     client.log_function = Mock()
-    client._log("USER_TRANSCRIPT", "private words")
-    client.log_function.assert_called_with("USER_TRANSCRIPT", "[content omitted]")
     client._log("FUNCTION_CALL", "private arguments")
     client.log_function.assert_called_with("FUNCTION_CALL", "[content omitted]")
     client.config["log_conversation_content"] = True
-    client._log("USER_TRANSCRIPT", "private words")
-    client.log_function.assert_called_with("USER_TRANSCRIPT", "private words")
+    client._log("FUNCTION_CALL", "private arguments")
+    client.log_function.assert_called_with("FUNCTION_CALL", "private arguments")
 
 
 def test_streamed_model_text_cannot_emit_terminal_controls(client, capsys):
@@ -320,8 +345,6 @@ def test_stop_with_timer_reaches_model_and_speech_hushes_alert(client, tmp_path)
 
     async def run():
         await client.timer_service.execute("create_timer", {"duration_seconds": 60})
-        assert not client._should_end_conversation("Stop.")
-        assert not client._should_end_conversation("Cancel my timer.")
         await client._handle_event({"type": "input_audio_buffer.speech_started"})
         client.on_user_activity.assert_called_once()
         await client.timer_service.close()

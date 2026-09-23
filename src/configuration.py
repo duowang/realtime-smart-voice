@@ -53,7 +53,7 @@ def load_config(path: str | Path | None = None) -> dict:
             or value <= 0
         ):
             raise ValueError(f"{name} must be a positive finite number of seconds")
-    for name in ("realtime_model", "realtime_voice", "transcription_model"):
+    for name in ("realtime_model", "realtime_voice"):
         if name in config and (not isinstance(config[name], str) or not config[name].strip()):
             raise ValueError(f"{name} must be a non-empty string")
     for name, default, lower, upper in (

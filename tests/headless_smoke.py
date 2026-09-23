@@ -160,10 +160,7 @@ async def run(args):
                 # Function names stay observable without enabling private argument logging.
                 calls = [message for kind, message in turn_events if kind == "TOOL_CALL"]
                 if expected_function not in calls:
-                    transcripts = [m for k, m in turn_events if k == "USER_TRANSCRIPT"]
-                    raise AssertionError(
-                        f"Expected {expected_function}; got calls={calls}, transcripts={transcripts}"
-                    )
+                    raise AssertionError(f"Expected {expected_function}; got calls={calls}")
 
                 status = player.get_status()
                 await asyncio.sleep(0.2)
