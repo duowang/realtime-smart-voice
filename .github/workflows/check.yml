@@ -26,6 +26,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m venv venv
+          venv/bin/python -m pip install --upgrade pip
           make dev-deps
       - name: Compile, lint and test without hardware or API credentials
         run: |
