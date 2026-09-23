@@ -124,14 +124,21 @@ class TimerService:
                     or type(record.get("deadline_utc")) not in (int, float)
                     or not math.isfinite(record["deadline_utc"])
                     or not isinstance(record.get("call_id", ""), str)
+                    or type(record.get("alert_queued", False)) is not bool
                 ):
                     raise ValueError("invalid timer record")
                 record = dict(record)
+                # Older stores have no marker. Their expired alerts were
+                # already queued during the original expiry tick.
+                record.setdefault("alert_queued", record["state"] == "expired")
                 remaining = record["deadline_utc"] - now
                 if record["state"] == "expired":
                     remaining = min(0, remaining)
-                # Recently expired alerts may have been interrupted by a crash.
-                if record["state"] in {"scheduled", "expired"}:
+                # Retry only an alert that was not queued before the restart.
+                if record["state"] == "expired" and record["alert_queued"]:
+                    if remaining < -RECOVERY_GRACE:
+                        record["state"] = "missed"
+                elif record["state"] in {"scheduled", "expired"}:
                     if remaining < -RECOVERY_GRACE:
                         record["state"] = "missed"
                     else:
@@ -257,6 +264,7 @@ class TimerService:
                     "_deadline": self.clock() + duration,
                     "state": "scheduled",
                     "call_id": call_id,
+                    "alert_queued": False,
                 }
                 records = records | {timer_id: timer}
                 while len(records) > HISTORY_LIMIT:
@@ -310,14 +318,19 @@ class TimerService:
                 return False
             now = self.clock()
             due = [
-                t | {"state": "expired"}
+                t | {"state": "expired", "alert_queued": False}
                 for t in self._timers.values()
-                if t["state"] == "scheduled" and t["_deadline"] <= now
+                if (t["state"] == "scheduled" and t["_deadline"] <= now)
+                or (t["state"] == "expired" and not t["alert_queued"])
             ]
             if due:
                 await self._commit(self._timers | {t["id"]: t for t in due})
                 if not self._closed:
                     self.on_expire([self._view(t) for t in due])
+                    await self._commit(
+                        self._timers
+                        | {t["id"]: t | {"alert_queued": True} for t in due}
+                    )
             return bool(self.tick())
 
     def start(self) -> None:

@@ -22,6 +22,8 @@ from timers import TIMER_NAMES, TIMER_TOOLS
 SAMPLE_RATE = 24000
 INPUT_FRAMES = 1024
 OUTPUT_FRAMES = 480  # 20 ms limits the amount of uninterruptible device output.
+MICROPHONE_PLAYBACK_GUARD_SECONDS = 0.5
+TIMER_CONFIRMATION_MAX_OUTPUT_TOKENS = 256
 
 
 class RealtimeVoiceClient:
@@ -119,6 +121,7 @@ class RealtimeVoiceClient:
         self._played_content_index = 0
         self._played_bytes = 0
         self._tool_in_progress = False
+        self._end_after_timer_confirmation = False
 
     def _get_realtime_model(self) -> str:
         """Return the configured Realtime model name."""
@@ -172,7 +175,9 @@ class RealtimeVoiceClient:
                 "Timers continue after this conversation but only sound while the app is running "
                 "and the computer is awake. Use returned IDs/labels; clarify ambiguous matches. "
                 "A bare stop while a timer is expired usually means dismiss the timer; if music "
-                "and timers are both plausible, ask which. Timer commands must not stop music."
+                "and timers are both plausible, ask which. Timer commands must not stop music. "
+                "For timer commands, call the tool without a spoken preamble. After a successful "
+                "tool result, give one short confirmation and then stop speaking."
             )
         return instructions
 
@@ -337,12 +342,31 @@ class RealtimeVoiceClient:
     async def _listen_for_audio(self) -> None:
         while not self.conversation_should_end:
             pcm = await audio_operation(self.stream.read, INPUT_FRAMES, exception_on_overflow=False)
+            # Speaker audio can leak into the microphone and make server VAD
+            # treat the assistant's own confirmation as a new user turn.
+            if self._assistant_audio_is_audible():
+                continue
             await self._send(
                 {
                     "type": "input_audio_buffer.append",
                     "audio": base64.b64encode(pcm).decode("ascii"),
                 }
             )
+
+    def _assistant_audio_is_audible(self) -> bool:
+        if (
+            self._end_after_timer_confirmation
+            or self._response_in_progress
+            or self._tool_in_progress
+            or self.is_assistant_speaking
+            or not self._output_queue.empty()
+        ):
+            return True
+        return (
+            self._assistant_finished_time is not None
+            and time.monotonic() - self._assistant_finished_time
+            < MICROPHONE_PLAYBACK_GUARD_SECONDS
+        )
 
     async def _handle_responses(self) -> None:
         while not self.conversation_should_end:
@@ -351,6 +375,12 @@ class RealtimeVoiceClient:
 
     async def _handle_event(self, event: dict) -> None:
         kind = event.get("type")
+        if self._end_after_timer_confirmation and kind in {
+            "input_audio_buffer.speech_started",
+            "input_audio_buffer.speech_stopped",
+        }:
+            # A late VAD event must not interrupt the committed timer's reply.
+            return
         if kind == "conversation.item.input_audio_transcription.completed":
             transcript = event.get("transcript", "")
             if transcript:
@@ -409,6 +439,14 @@ class RealtimeVoiceClient:
             return
         self._assistant_finished_time = time.monotonic()
         calls = [item for item in response.get("output", []) if item.get("type") == "function_call"]
+        if self._end_after_timer_confirmation:
+            # The timer is already committed. Finish its single confirmation,
+            # then return to wake-word mode. Never execute another tool call
+            # from this turn, even if a response violates tool_choice=none.
+            await self._output_queue.join()
+            await asyncio.sleep(MICROPHONE_PLAYBACK_GUARD_SECONDS)
+            self._request_end()
+            return
         # Execute completed calls once, after response.done. This also prevents a
         # follow-up response.create from racing the preceding tool response.
         started_music = False
@@ -426,6 +464,8 @@ class RealtimeVoiceClient:
                     result = await self.timer_service.execute(
                         name, arguments, call_id=f"{self._session_id}:{call['call_id']}"
                     )
+                    if name == "create_timer" and result.get("success"):
+                        self._end_after_timer_confirmation = True
                 else:
                     result = await self.music_handler.execute(name, arguments)
                     started_music = result.get("success") and result.get("action") == "play"
@@ -445,7 +485,13 @@ class RealtimeVoiceClient:
         if started_music:
             self._request_end()
         elif calls:
-            await self._send({"type": "response.create"})
+            response = {"type": "response.create"}
+            if self._end_after_timer_confirmation:
+                response["response"] = {
+                    "tool_choice": "none",
+                    "max_output_tokens": TIMER_CONFIRMATION_MAX_OUTPUT_TOKENS,
+                }
+            await self._send(response)
             self._response_in_progress = True
 
     async def _play_output(self) -> None:

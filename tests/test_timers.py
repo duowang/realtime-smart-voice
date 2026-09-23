@@ -150,6 +150,60 @@ def test_recovery_rings_recent_but_marks_old_expiry_missed(setup):
     asyncio.run(run())
 
 
+def test_delivered_expiry_does_not_alert_again_after_restart(setup):
+    service, clock, expired, _ = setup
+
+    async def run():
+        await service.execute("create_timer", {"duration_seconds": 10})
+        clock.advance(10)
+        await service.poll()
+        expired.assert_called_once()
+        saved = json.loads(service.path.read_text())
+        assert saved["timers"][0]["alert_queued"] is True
+
+        for legacy in (False, True):
+            if legacy:
+                # Legacy stores lack the marker but already queued expired alerts.
+                del saved["timers"][0]["alert_queued"]
+                service.path.write_text(json.dumps(saved))
+            replay = Mock()
+            restored = TimerService(
+                service.path,
+                on_expire=replay,
+                wall_clock=lambda: clock.wall,
+                clock=lambda: clock.elapsed,
+            )
+            await restored.poll()
+            replay.assert_not_called()
+            assert (await restored.execute("get_timers", {}))["timers"][0]["state"] == "expired"
+
+    asyncio.run(run())
+
+
+def test_unqueued_expiry_is_retried_after_restart(setup):
+    service, clock, *_ = setup
+
+    async def run():
+        await service.execute("create_timer", {"duration_seconds": 10})
+        clock.advance(10)
+        saved = json.loads(service.path.read_text())
+        saved["timers"][0]["state"] = "expired"
+        service.path.write_text(json.dumps(saved))
+        replay = Mock()
+        restored = TimerService(
+            service.path,
+            on_expire=replay,
+            wall_clock=lambda: clock.wall,
+            clock=lambda: clock.elapsed,
+        )
+        await restored.poll()
+        await restored.poll()
+        replay.assert_called_once()
+        assert json.loads(service.path.read_text())["timers"][0]["alert_queued"] is True
+
+    asyncio.run(run())
+
+
 def test_wall_clock_jump_does_not_change_running_countdown(setup):
     service, clock, expired, _ = setup
 

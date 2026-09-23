@@ -161,6 +161,37 @@ def test_streamed_model_text_cannot_emit_terminal_controls(client, capsys):
     assert "\x1b" not in text and "\x07" not in text
 
 
+def test_microphone_does_not_send_assistant_playback_to_vad(client, monkeypatch):
+    sent = []
+    frame = 0
+    client.stream = Mock()
+
+    async def read_frame(*_args, **_kwargs):
+        nonlocal frame
+        frame += 1
+        if frame == 1:
+            client._response_in_progress = True
+        elif frame == 2:
+            client._response_in_progress = False
+            client.is_assistant_speaking = True
+        elif frame == 3:
+            client.is_assistant_speaking = False
+            client._assistant_finished_time = time.monotonic()
+        else:
+            client._assistant_finished_time = time.monotonic() - 1
+            client._request_end()
+        return b"\0" * 2048
+
+    async def send(event):
+        sent.append(event)
+
+    monkeypatch.setattr(module, "audio_operation", read_frame)
+    client._send = send
+    asyncio.run(client._listen_for_audio())
+    assert frame == 4
+    assert [event["type"] for event in sent] == ["input_audio_buffer.append"]
+
+
 def test_timer_tools_route_to_shared_service_and_outlive_conversation(client, tmp_path):
     expired = Mock()
     now = [0.0]
@@ -182,6 +213,9 @@ def test_timer_tools_route_to_shared_service_and_outlive_conversation(client, tm
         outputs = [json.loads(c.args[0]) for c in client.websocket.send.call_args_list]
         assert json.loads(outputs[0]["item"]["output"])["timer"]["label"] == "tea"
         assert outputs[-1]["type"] == "response.create"
+        assert outputs[-1]["response"]["tool_choice"] == "none"
+        assert outputs[-1]["response"]["max_output_tokens"] == 256
+        assert client._assistant_audio_is_audible()
         # Replaying a completed call cannot create another timer.
         await client._handle_event(
             tool_response("create_timer", '{"duration_seconds":60,"label":"tea"}')
@@ -192,6 +226,56 @@ def test_timer_tools_route_to_shared_service_and_outlive_conversation(client, tm
         await client.timer_service.poll()
         expired.assert_called_once()
         await client.timer_service.close()
+
+    asyncio.run(run())
+
+
+def test_timer_confirmation_finishes_playback_and_cannot_call_tool_again(
+    client, monkeypatch
+):
+    monkeypatch.setattr(module, "MICROPHONE_PLAYBACK_GUARD_SECONDS", 0.01)
+    client.timer_service = Mock(execute=AsyncMock(return_value={"success": True}))
+    client.websocket = Mock(send=AsyncMock())
+    client.audio = Mock()
+    client.on_user_activity = Mock()
+    release_playback = asyncio.Event()
+
+    async def audio_operation(operation, *_args, **_kwargs):
+        if operation is client.audio.open.return_value.write:
+            await release_playback.wait()
+
+    monkeypatch.setattr(module, "audio_operation", audio_operation)
+
+    async def run():
+        await client._handle_event(tool_response("create_timer", '{"duration_seconds":600}'))
+        await client._handle_event(
+            {
+                "type": "response.output_audio.delta",
+                "item_id": "confirmation",
+                "delta": base64.b64encode(b"\0" * 960).decode(),
+            }
+        )
+        await client._handle_event({"type": "input_audio_buffer.speech_started"})
+        assert not client._output_queue.empty()
+        client.on_user_activity.assert_not_called()
+        playback = asyncio.create_task(client._play_output())
+        try:
+            # Even a model response that ignores tool_choice=none must not
+            # execute a second create_timer after the first one succeeds.
+            finish = asyncio.create_task(
+                client._handle_event(tool_response("create_timer", '{"duration_seconds":600}'))
+            )
+            await asyncio.sleep(0)
+            assert not finish.done()
+            assert not client.conversation_should_end
+            release_playback.set()
+            await asyncio.wait_for(finish, 1)
+            assert client.conversation_should_end
+            client.timer_service.execute.assert_awaited_once()
+        finally:
+            release_playback.set()
+            playback.cancel()
+            await asyncio.gather(playback, return_exceptions=True)
 
     asyncio.run(run())
 
