@@ -1,6 +1,7 @@
 """Offline wake-word detection using sherpa-onnx and the local microphone."""
 
 import logging
+import math
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
@@ -17,6 +18,7 @@ from wake_word_model import DEFAULT_MODEL_DIR, PROJECT_ROOT, ensure_wake_word_mo
 SAMPLE_RATE = 16000
 FRAME_LENGTH = 512
 DEFAULT_THRESHOLD = 0.1
+DEFAULT_INPUT_BOOST = 4.0
 MAX_ACTIVE_PATHS = 8
 
 
@@ -50,12 +52,17 @@ class WakeWordDetector:
         self.audio = None
         self.stream = None
         self.keyword_stream = None
+        self.boosted_keyword_stream = None
         self.is_listening = False
         self.wake_keywords = config.get("wake_keywords", ["Hi Taco"])
 
         threshold = float(config.get("wake_word_threshold", DEFAULT_THRESHOLD))
         if not 0 < threshold <= 1:
             raise ValueError("wake_word_threshold must be greater than 0 and at most 1")
+        boost = config.get("wake_word_input_boost", DEFAULT_INPUT_BOOST)
+        if type(boost) not in (int, float) or not math.isfinite(boost) or not 1 <= boost <= 8:
+            raise ValueError("wake_word_input_boost must be between 1 and 8")
+        self.input_boost = float(boost)
         model_dir = Path(config.get("wake_word_model_dir", DEFAULT_MODEL_DIR)).expanduser()
         if not model_dir.is_absolute():
             model_dir = PROJECT_ROOT / model_dir
@@ -84,7 +91,11 @@ class WakeWordDetector:
                 provider="cpu",
             )
         self.audio = pyaudio.PyAudio()
-        self._log("WAKE_WORD_INIT", f"sherpa-onnx ready for {', '.join(self.wake_keywords)}")
+        self._log(
+            "WAKE_WORD_INIT",
+            f"sherpa-onnx ready for {', '.join(self.wake_keywords)} "
+            f"(quiet-input boost {self.input_boost:g}x)",
+        )
 
     def _log(self, log_type: str, message: str):
         if self.log_function:
@@ -98,6 +109,8 @@ class WakeWordDetector:
         # A fresh decoder stream prevents pre-conversation audio from triggering
         # again when control returns from the Realtime client.
         self.keyword_stream = self.spotter.create_stream()
+        if self.input_boost > 1:
+            self.boosted_keyword_stream = self.spotter.create_stream()
         self.stream = self.audio.open(
             format=pyaudio.paInt16,
             channels=1,
@@ -110,17 +123,29 @@ class WakeWordDetector:
         self._log("WAKE_WORD_START", "Started offline wake-word detection")
 
     def process_audio(self, audio_frame: bytes) -> str | None:
-        """Feed PCM16 microphone audio to sherpa as normalized float32 samples."""
+        """Try original and boosted PCM on separate decoder histories.
+
+        The original path preserves louder speech that can distort when boosted.
+        Both histories are reset together after a hit so one phrase cannot wake twice.
+        """
         if self.keyword_stream is None:
             self.keyword_stream = self.spotter.create_stream()
+        if self.input_boost > 1 and self.boosted_keyword_stream is None:
+            self.boosted_keyword_stream = self.spotter.create_stream()
         samples = np.frombuffer(audio_frame, dtype=np.int16).astype(np.float32) / 32768.0
-        self.keyword_stream.accept_waveform(SAMPLE_RATE, samples)
-        while self.spotter.is_ready(self.keyword_stream):
-            self.spotter.decode_stream(self.keyword_stream)
-            result = self.spotter.get_result(self.keyword_stream)
-            if result:
-                self.spotter.reset_stream(self.keyword_stream)
-                return self._keyword_labels[result]
+        streams = [(self.keyword_stream, samples)]
+        if self.boosted_keyword_stream is not None:
+            boosted = np.clip(samples * self.input_boost, -1.0, 1.0)
+            streams.append((self.boosted_keyword_stream, boosted))
+        for stream, waveform in streams:
+            stream.accept_waveform(SAMPLE_RATE, waveform)
+            while self.spotter.is_ready(stream):
+                self.spotter.decode_stream(stream)
+                result = self.spotter.get_result(stream)
+                if result:
+                    for decoder, _ in streams:
+                        self.spotter.reset_stream(decoder)
+                    return self._keyword_labels[result]
         return None
 
     async def listen_for_wake_word(self) -> str | None:
@@ -138,6 +163,7 @@ class WakeWordDetector:
     def _close_stream(self):
         self.is_listening = False
         self.keyword_stream = None
+        self.boosted_keyword_stream = None
         stream, self.stream = self.stream, None
         if stream is not None:
             close_stream(stream)

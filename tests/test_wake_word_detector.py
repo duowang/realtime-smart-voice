@@ -96,22 +96,58 @@ def test_invalid_threshold_fails_before_downloading(detector_module, threshold):
     module.ensure_wake_word_model.assert_not_called()
 
 
-def test_pcm_is_normalized_without_overflow(detector_module):
+@pytest.mark.parametrize("boost", [0, 0.5, 9, float("nan"), "4", True])
+def test_invalid_input_boost_fails_before_downloading(detector_module, boost):
+    module, _, _, _, _ = detector_module
+    with pytest.raises(ValueError, match="wake_word_input_boost"):
+        module.WakeWordDetector({"wake_word_input_boost": boost})
+    module.ensure_wake_word_model.assert_not_called()
+
+
+def test_pcm_uses_original_and_clipped_boosted_decoder_histories(detector_module):
     module, _, spotter, _, _ = detector_module
     detector = module.WakeWordDetector({})
-    pcm = np.array([-32768, 0, 32767], dtype=np.int16)
+    original, boosted = Mock(), Mock()
+    spotter.create_stream.side_effect = [original, boosted]
+    pcm = np.array([-32768, -4096, 0, 4096, 32767], dtype=np.int16)
     assert detector.process_audio(pcm.tobytes()) is None
-    rate, samples = spotter.create_stream.return_value.accept_waveform.call_args.args
-    assert rate == 16000
-    assert samples.dtype == np.float32
-    np.testing.assert_array_equal(samples, [-1, 0, 32767 / 32768])
+    raw_rate, raw_samples = original.accept_waveform.call_args.args
+    boosted_rate, boosted_samples = boosted.accept_waveform.call_args.args
+    assert raw_rate == boosted_rate == 16000
+    assert raw_samples.dtype == boosted_samples.dtype == np.float32
+    np.testing.assert_array_equal(raw_samples, [-1, -0.125, 0, 0.125, 32767 / 32768])
+    np.testing.assert_array_equal(boosted_samples, [-1, -0.5, 0, 0.5, 1])
+
+
+def test_boost_can_be_disabled(detector_module):
+    module, _, spotter, _, _ = detector_module
+    detector = module.WakeWordDetector({"wake_word_input_boost": 1})
+    detector.process_audio(np.zeros(512, dtype=np.int16).tobytes())
+    spotter.create_stream.assert_called_once()
+    assert detector.boosted_keyword_stream is None
+
+
+def test_boosted_decoder_can_detect_when_original_does_not(detector_module):
+    module, _, spotter, _, _ = detector_module
+    detector = module.WakeWordDetector({})
+    original, boosted = Mock(), Mock()
+    spotter.create_stream.side_effect = [original, boosted]
+    spotter.is_ready.side_effect = [True, False, True]
+    spotter.get_result.side_effect = ["", "wake_0"]
+
+    assert detector.process_audio(np.zeros(512, dtype=np.int16).tobytes()) == "Hi Taco"
+    assert [call.args[0] for call in spotter.reset_stream.call_args_list] == [
+        original, boosted
+    ]
 
 
 def test_detection_releases_microphone_and_restarts_with_fresh_decoder(detector_module):
     module, audio, spotter, _, _ = detector_module
     detector = module.WakeWordDetector({})
-    old_decoder, new_decoder = Mock(), Mock()
-    spotter.create_stream.side_effect = [old_decoder, new_decoder]
+    old_decoder, old_boosted, new_decoder, new_boosted = Mock(), Mock(), Mock(), Mock()
+    spotter.create_stream.side_effect = [
+        old_decoder, old_boosted, new_decoder, new_boosted
+    ]
     spotter.is_ready.return_value = True
     spotter.get_result.return_value = "wake_0"
     old_microphone = Mock()
@@ -119,15 +155,19 @@ def test_detection_releases_microphone_and_restarts_with_fresh_decoder(detector_
     audio.open.side_effect = [old_microphone, Mock()]
 
     assert asyncio.run(detector.listen_for_wake_word()) == "Hi Taco"
-    spotter.reset_stream.assert_called_once_with(old_decoder)
+    assert [call.args[0] for call in spotter.reset_stream.call_args_list] == [
+        old_decoder, old_boosted
+    ]
     old_microphone.stop_stream.assert_called_once()
     old_microphone.close.assert_called_once()
     assert not detector.is_listening
     assert detector.keyword_stream is None
+    assert detector.boosted_keyword_stream is None
 
     asyncio.run(detector.start_listening())
     assert detector.is_listening
     assert detector.keyword_stream is new_decoder
+    assert detector.boosted_keyword_stream is new_boosted
     detector.cleanup()
     detector.cleanup()
     audio.terminate.assert_called_once()

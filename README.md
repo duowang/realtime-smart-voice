@@ -144,6 +144,7 @@ cp -n config/config.json config/local.json
 | --- | --- | --- |
 | `wake_keywords` | `["Hi Taco"]` | English wake phrases; no phrase training needed |
 | `wake_word_threshold` | `0.1` | Higher values reduce false wakes but may miss more speech; range `(0, 1]` |
+| `wake_word_input_boost` | `4.0` | Also check a boosted microphone signal for quiet wake phrases; use `1` to disable, range `[1, 8]` |
 | `log_conversation_content` | `false` | Opt in to saving transcripts and tool arguments in local logs |
 | `music_volume` | `0.35` | Playback volume, from 0 to 1 |
 | `realtime_model` | `gpt-realtime-2.1` | OpenAI Realtime model |
@@ -181,7 +182,7 @@ Start with `./run.sh --doctor`. It checks Python, imports, FFmpeg, the selected 
 | `Python.h` is missing | Install `python3.12-dev` for system Python, or use uv to create a fresh environment. |
 | A Python dependency is missing | Rerun `./run.sh --setup-only` to reinstall missing requirements. |
 | No microphone input | Allow microphone access for your terminal and check the system's default input device and level. |
-| “Hi Taco” is missed | Say it clearly, reduce speaker volume, and check `wake_keywords`. Adjust the threshold cautiously. |
+| “Hi Taco” is missed | Check that your intended microphone is the system input, speak at normal distance, and check `wake_keywords`. Quiet-room misses may improve with `wake_word_input_boost`; adjust it before lowering the threshold. |
 | Model download or checksum fails | Check the connection and rerun setup with the same `--config`. Unverified downloads are not installed. |
 | OpenAI rejects the key or session | Check the key, project access, model availability, and API usage limits in your OpenAI account. |
 | Music search/download fails | Check connectivity and FFmpeg. YouTube availability can vary; try another track. |
