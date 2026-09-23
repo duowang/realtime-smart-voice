@@ -157,8 +157,9 @@ async def run(args):
                 await asyncio.wait_for(assistant.handle_wake_word_detection(), timeout=args.timeout)
                 turn_events = events[event_start:]
                 expected_function = f"{name}_music"
-                calls = [message for kind, message in turn_events if kind == "FUNCTION_CALL"]
-                if not any(message.startswith(expected_function + "(") for message in calls):
+                # Function names stay observable without enabling private argument logging.
+                calls = [message for kind, message in turn_events if kind == "TOOL_CALL"]
+                if expected_function not in calls:
                     transcripts = [m for k, m in turn_events if k == "USER_TRANSCRIPT"]
                     raise AssertionError(
                         f"Expected {expected_function}; got calls={calls}, transcripts={transcripts}"

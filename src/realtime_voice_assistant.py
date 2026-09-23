@@ -6,7 +6,6 @@ import asyncio
 import logging
 import signal
 from contextlib import AsyncExitStack
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import numpy as np
@@ -15,6 +14,7 @@ import soundfile as sf
 
 from audio_io import audio_operation, close_stream
 from configuration import PROJECT_ROOT, get_api_key, load_config
+from diagnostics import PrivateRotatingFileHandler, log_message, safe_text
 from music_commands import MusicCommandHandler
 from realtime_voice_client import RealtimeVoiceClient
 from timer_alerts import TimerAlerts
@@ -25,7 +25,7 @@ from wake_word_detector import WakeWordDetector
 class RealtimeVoiceAssistant:
     def __init__(self, config_file: str | Path | None = None):
         self.config = load_config(config_file)
-        get_api_key(self.config)  # Validate before downloading models or opening devices.
+        self._api_key = get_api_key(self.config)  # Validate before opening devices.
         self.running = False
         self._shutting_down = False
         self._cleaned_up = False
@@ -77,7 +77,7 @@ class RealtimeVoiceAssistant:
         for timer in timers:
             self._pending_timer_alerts[timer["timer_id"]] = timer
             self._log_event("TIMER_EXPIRED", timer["timer_id"])
-            print(f"Timer finished: {timer['label']}")
+            print(f"Timer finished: {safe_text(timer['label'])}")
 
     def _tick_timer_alerts(self) -> bool:
         self.timer_alerts.update()
@@ -115,13 +115,14 @@ class RealtimeVoiceAssistant:
 
     def _setup_logging(self) -> None:
         directory = PROJECT_ROOT / "logs"
-        directory.mkdir(exist_ok=True)
+        directory.mkdir(mode=0o700, exist_ok=True)
+        directory.chmod(0o700)
         # An instance owns its handler; constructing another assistant must not
         # clear or close the first one's handlers.
         self.logger = logging.getLogger(f"realtime_voice_assistant.{id(self)}")
         self.logger.setLevel(logging.INFO)
         self.logger.propagate = False
-        self._log_handler = RotatingFileHandler(
+        self._log_handler = PrivateRotatingFileHandler(
             directory / "realtime_voice_assistant.log",
             maxBytes=5_000_000,
             backupCount=2,
@@ -138,7 +139,16 @@ class RealtimeVoiceAssistant:
             self._log_handler = None
 
     def _log_event(self, kind: str, message: str) -> None:
-        self.logger.info("%s: %s", kind, message)
+        self.logger.info(
+            "%s: %s",
+            safe_text(kind),
+            log_message(
+                kind,
+                message,
+                include_content=self.config.get("log_conversation_content", False),
+                secret=self._api_key,
+            ),
+        )
 
     async def _play_audio_file(self, path: str | Path, description: str, log_prefix: str) -> None:
         audio = stream = None
@@ -197,7 +207,7 @@ class RealtimeVoiceAssistant:
             self._log_event("CONVERSATION_TIMEOUT", "Returning to wake-word detection")
         except Exception as error:
             self._log_event("CONVERSATION_ERROR", str(error))
-            print(f"Conversation failed: {error}")
+            print(f"Conversation failed: {safe_text(error, secret=self._api_key)}")
         finally:
             # Also restores an automatic pause when greeting/connection setup fails.
             await self.realtime_client.stop_conversation(resume_music=not self._shutting_down)
@@ -272,7 +282,7 @@ async def main() -> int:
         assistant = RealtimeVoiceAssistant(args.config)
         await assistant.run_continuous_mode()
     except Exception as error:
-        print(f"Assistant failed: {error}")
+        print(f"Assistant failed: {safe_text(error)}")
         return 1
     return 0
 

@@ -3,13 +3,40 @@
 import asyncio
 import base64
 import os
+import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import requests
 from PIL import Image
+
+MAX_THUMBNAIL_BYTES = 8 * 1024 * 1024
+MAX_THUMBNAIL_PIXELS = 16_000_000
+THUMBNAIL_HOSTS = ("ytimg.com", "ggpht.com", "googleusercontent.com")
+IMAGE_FORMATS = ("JPEG", "PNG", "WEBP")
+
+
+def validate_thumbnail_url(url: str) -> None:
+    """Only fetch provider artwork; arbitrary hosts and redirects are unnecessary."""
+    parsed = urlsplit(url)
+    host = parsed.hostname or ""
+    if (
+        parsed.scheme != "https"
+        or parsed.username
+        or parsed.password
+        or parsed.port not in (None, 443)
+        or not any(host == domain or host.endswith("." + domain) for domain in THUMBNAIL_HOSTS)
+    ):
+        raise ValueError("Artwork must use an HTTPS YouTube/Google image URL")
+
+
+def check_image_size(image: Image.Image) -> None:
+    if image.width * image.height > MAX_THUMBNAIL_PIXELS:
+        raise ValueError("Artwork exceeds the pixel limit")
 
 
 class AlbumArt:
@@ -25,26 +52,47 @@ class AlbumArt:
 
     async def download(self, thumbnail_url: str, song_id: str) -> str | None:
         """Validate images and replace the cache only after a complete download."""
+        if not isinstance(song_id, str) or not re.fullmatch(r"[0-9a-f]{12}", song_id):
+            return None
         path = self.cache_dir / f"{song_id}_thumb.jpg"
 
         def fetch():
-            if path.is_file():
+            validate_thumbnail_url(thumbnail_url)
+            if path.is_file() and path.stat().st_size <= MAX_THUMBNAIL_BYTES:
                 try:
-                    with Image.open(path) as image:
+                    with Image.open(path, formats=IMAGE_FORMATS) as image:
+                        check_image_size(image)
                         if image.width >= 1000:
                             return str(path)
                 except (OSError, ValueError):
                     pass
-            with requests.get(thumbnail_url, timeout=10) as response:
+            deadline = time.monotonic() + 30
+            with requests.get(
+                thumbnail_url, timeout=(5, 10), stream=True, allow_redirects=False
+            ) as response:
                 response.raise_for_status()
+                if response.status_code != 200:
+                    raise ValueError("Artwork redirects are not allowed")
+                if int(response.headers.get("Content-Length", "0")) > MAX_THUMBNAIL_BYTES:
+                    raise ValueError("Artwork exceeds the download limit")
                 with tempfile.TemporaryDirectory(dir=self.cache_dir) as staging:
                     downloaded = Path(staging) / "download"
-                    downloaded.write_bytes(response.content)
-                    with Image.open(downloaded) as image:
+                    size = 0
+                    with downloaded.open("wb") as output:
+                        for chunk in response.iter_content(64 * 1024):
+                            size += len(chunk)
+                            if size > MAX_THUMBNAIL_BYTES or time.monotonic() > deadline:
+                                raise ValueError("Artwork exceeds the download size/time limit")
+                            output.write(chunk)
+                    with Image.open(downloaded, formats=IMAGE_FORMATS) as image:
+                        check_image_size(image)
                         image.verify()
                     converted = Path(staging) / "thumbnail.jpg"
-                    with Image.open(downloaded) as image:
+                    with Image.open(downloaded, formats=IMAGE_FORMATS) as image:
+                        check_image_size(image)
                         image.convert("RGB").save(converted, format="JPEG")
+                    if converted.stat().st_size > MAX_THUMBNAIL_BYTES:
+                        raise ValueError("Converted artwork exceeds the size limit")
                     converted.replace(path)
             return str(path)
 
@@ -141,11 +189,15 @@ class AlbumArt:
         title = "".join(character for character in title if character.isprintable())
         artist = "".join(character for character in artist if character.isprintable())
         try:
+            if Path(thumb_path).stat().st_size > MAX_THUMBNAIL_BYTES:
+                raise ValueError("Cached artwork exceeds the size limit")
+            with Image.open(thumb_path, formats=IMAGE_FORMATS) as source:
+                check_image_size(source)
             # Prefer native iTerm2 inline rendering for much higher visual quality.
             if self._render_thumbnail_iterm2(thumb_path, title, artist):
                 return
 
-            with Image.open(thumb_path) as source:
+            with Image.open(thumb_path, formats=IMAGE_FORMATS) as source:
                 img = source.convert("RGB")
 
             try:

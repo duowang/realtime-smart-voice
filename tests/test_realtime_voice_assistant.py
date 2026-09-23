@@ -15,6 +15,7 @@ from realtime_voice_assistant import RealtimeVoiceAssistant
 def assistant():
     result = object.__new__(RealtimeVoiceAssistant)
     result.config = {"conversation_timeout": 1}
+    result._api_key = "test-key"
     result._shutting_down = False
     result._cleaned_up = False
     result.timer_service = Mock(close=AsyncMock())
@@ -54,6 +55,21 @@ def test_failed_conversation_restores_music(assistant):
     assistant.realtime_client.stop_conversation.assert_awaited_once_with(resume_music=True)
 
 
+def test_timer_labels_cannot_emit_terminal_controls(assistant, capsys):
+    assistant._queue_timer_alerts([{"timer_id": "a", "label": "tea\x1b]52;c;payload\x07"}])
+    output = capsys.readouterr().out
+    assert "Timer finished: tea" in output
+    assert "\x1b" not in output and "\x07" not in output
+
+
+def test_assistant_log_boundary_omits_music_content_and_redacts_errors(assistant):
+    assistant.logger = Mock()
+    RealtimeVoiceAssistant._log_event(assistant, "MUSIC_SEARCH", "private query")
+    assistant.logger.info.assert_called_with("%s: %s", "MUSIC_SEARCH", "[content omitted]")
+    RealtimeVoiceAssistant._log_event(assistant, "CONVERSATION_ERROR", "key=test-key\x1b[31m")
+    assistant.logger.info.assert_called_with("%s: %s", "CONVERSATION_ERROR", "key=[REDACTED][31m")
+
+
 def test_timeout_covers_the_active_conversation(assistant):
     cancelled = []
 
@@ -82,7 +98,9 @@ def test_failed_greeting_write_releases_every_resource(assistant, monkeypatch):
     audio.terminate.assert_called_once()
 
 
-def test_greeting_drain_keeps_loop_responsive_and_finishes_before_termination(assistant, monkeypatch):
+def test_greeting_drain_keeps_loop_responsive_and_finishes_before_termination(
+    assistant, monkeypatch
+):
     entered, release = threading.Event(), threading.Event()
     audio = Mock()
 

@@ -2,14 +2,21 @@ name: Check
 on:
   push:
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 15 * * 1'
 permissions:
   contents: read
 jobs:
   test:
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: actions/setup-python@v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
           cache: pip
@@ -24,3 +31,18 @@ jobs:
         run: |
           bash -n run.sh
           make check
+      - name: Audit dependencies and Python security
+        run: |
+          make security-deps
+          make audit
+      - name: Scan Git history for secrets
+        env:
+          GITLEAKS_VERSION: '8.30.1'
+        run: |
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl --fail --location --retry 2 --max-time 120 \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            --output "$archive"
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $archive" | sha256sum --check
+          tar -xzf "$archive" -C "$RUNNER_TEMP" gitleaks
+          "$RUNNER_TEMP/gitleaks" git --redact=100 --log-opts=--all --no-banner .

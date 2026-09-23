@@ -2,7 +2,10 @@
 
 import logging
 
+from diagnostics import log_message
 from youtube_music_player import YouTubeMusicPlayer
+
+MAX_QUERY_LENGTH = 300
 
 
 class MusicCommandHandler:
@@ -14,7 +17,7 @@ class MusicCommandHandler:
         if self.log_function:
             self.log_function(kind, message)
         else:
-            logging.getLogger(__name__).info("[%s] %s", kind, message)
+            logging.getLogger(__name__).info("[%s] %s", kind, log_message(kind, message))
 
     @staticmethod
     def _result(success: bool, action: str, response: str, **details) -> dict:
@@ -29,14 +32,19 @@ class MusicCommandHandler:
             "get_music_status": self._status,
             "skip_song": self._skip,
         }
-        handler = handlers.get(function_name)
+        handler = handlers.get(function_name) if isinstance(function_name, str) else None
         if handler is None:
             return self._result(False, "unknown", f"Unknown music function: {function_name}")
         if not isinstance(arguments, dict):
             return self._result(False, "invalid_arguments", "Music arguments must be an object.")
+        allowed = {"query"} if function_name == "play_music" else set()
+        if set(arguments) != allowed:
+            return self._result(
+                False, "invalid_arguments", "Unexpected or missing music arguments."
+            )
         if function_name == "play_music":
             query = arguments.get("query")
-            if not isinstance(query, str) or not query.strip():
+            if not isinstance(query, str) or not 1 <= len(query.strip()) <= MAX_QUERY_LENGTH:
                 return self._result(False, "invalid_arguments", "Please provide a song or artist.")
             arguments = {"query": query.strip()}
         self._log("MUSIC_FUNCTION_CALL", f"{function_name}({arguments})")

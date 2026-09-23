@@ -300,7 +300,18 @@ def test_invalid_volume_rejected_before_hardware_or_network(player, volume, monk
     api.assert_not_called()
 
 
-@pytest.mark.parametrize("arguments", [[], None, {"query": 5}, {"query": "  "}, {}])
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        [],
+        None,
+        {"query": 5},
+        {"query": "  "},
+        {},
+        {"query": "x" * 301},
+        {"query": "music", "url": "https://example.test"},
+    ],
+)
 def test_invalid_play_arguments_never_search(player, arguments):
     player.play_search_result = AsyncMock()
     result = asyncio.run(handler_for(player).execute("play_music", arguments))
@@ -351,6 +362,19 @@ def test_download_publishes_complete_audio_and_removes_staging(player, monkeypat
     assert destination.read_bytes() == b"complete download"
     assert list(player_module.Path(player.cache_dir).iterdir()) == [destination]
     assert options[0]["noplaylist"]
+    assert options[0]["max_filesize"] == player_module.MAX_SONG_BYTES
+    filter_track = options[0]["match_filter"]
+    assert filter_track({"is_live": True})
+    assert filter_track({"duration": player_module.MAX_SONG_SECONDS + 1})
+    assert filter_track({"duration": 180}) is None
+    with pytest.raises(player_module.yt_dlp.utils.DownloadError, match="download limit"):
+        options[0]["progress_hooks"][0]({"downloaded_bytes": player_module.MAX_SONG_BYTES + 1})
+
+
+def test_unexpected_stop_arguments_do_not_stop_music(playing):
+    playing.stop = AsyncMock()
+    assert not asyncio.run(handler_for(playing).execute("stop_music", {"all": True}))["success"]
+    playing.stop.assert_not_awaited()
 
 
 def test_failed_download_preserves_previous_audio(player, monkeypatch):

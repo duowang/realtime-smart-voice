@@ -22,6 +22,7 @@ from configuration import get_api_key, load_config
         {"timer_alert_seconds": 31},
         {"timer_alert_seconds": float("inf")},
         {"timer_store_path": ""},
+        {"log_conversation_content": "false"},
     ],
 )
 def test_invalid_config_fails_before_runtime(tmp_path, value):

@@ -15,6 +15,7 @@ MODEL_URL = (
     f"https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/{MODEL_NAME}.tar.bz2"
 )
 MODEL_SHA256 = "f170013b4716e41b62b9bfd809687c207cef798ef9bc6534d524e17af9b6561a"
+MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
 DEFAULT_MODEL_DIR = PROJECT_ROOT / "models" / MODEL_NAME
 MODEL_FILES = {
     "encoder": "encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
@@ -45,7 +46,11 @@ def ensure_wake_word_model(model_dir: Path = DEFAULT_MODEL_DIR) -> dict[str, Pat
             with requests.get(MODEL_URL, stream=True, timeout=(15, 60)) as response:
                 response.raise_for_status()
                 with archive.open("wb") as output:
+                    size = 0
                     for block in response.iter_content(chunk_size=1024 * 1024):
+                        size += len(block)
+                        if size > MAX_ARCHIVE_BYTES:
+                            raise ValueError("Wake-word model download exceeds the size limit")
                         digest.update(block)
                         output.write(block)
             if digest.hexdigest() != MODEL_SHA256:

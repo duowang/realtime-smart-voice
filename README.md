@@ -103,6 +103,8 @@ Saying “Hi Taco” pauses music for the conversation. Music resumes afterward 
 
 Playback defaults to 35% volume to help the microphone hear the wake phrase. Loud music can still mask speech; acoustic echo cancellation is not implemented. Lower `music_volume` or move the microphone farther from the speakers if wake detection becomes unreliable.
 
+Live streams and tracks with a known duration over two hours are rejected. Downloads and converted tracks are limited to 200 MiB each. The cache has no automatic eviction; remove unwanted cached tracks while the app is stopped to reclaim disk space.
+
 ### Timer behavior
 
 Timers keep running between conversations and while music plays. At expiry, the terminal prints the label and a local chime sounds for up to ten seconds, temporarily lowering music volume. “Hi Taco” hushes the chime; you can then check or dismiss the expired timer. Chimes wait for an ongoing spoken turn to finish. Cancelling or dismissing a timer does not change music playback intent.
@@ -142,6 +144,7 @@ cp -n config/config.json config/local.json
 | --- | --- | --- |
 | `wake_keywords` | `["Hi Taco"]` | English wake phrases; no phrase training needed |
 | `wake_word_threshold` | `0.1` | Higher values reduce false wakes but may miss more speech; range `(0, 1]` |
+| `log_conversation_content` | `false` | Opt in to saving transcripts and tool arguments in local logs |
 | `music_volume` | `0.35` | Playback volume, from 0 to 1 |
 | `realtime_model` | `gpt-realtime-2.1` | OpenAI Realtime model |
 | `realtime_voice` | `marin` | Assistant voice |
@@ -157,6 +160,14 @@ cp -n config/config.json config/local.json
 Keep the API key in `.env`, not in a config you share. A shell `OPENAI_API_KEY` overrides `.env`; `.env` overrides the optional JSON key. `.env` is parsed as data, never executed as shell code.
 
 The English [sherpa-onnx keyword model](https://k2-fsa.github.io/sherpa/onnx/kws/pretrained_models/index.html) uses its bundled tokenizer for wake phrases containing English letters, apostrophes, and spaces. After the verified first download, it runs offline from `models/`. An optional `wake_word_model_dir` changes the model directory. Relative model and timer paths resolve from the repository root.
+
+## Privacy and safety
+
+Wake detection runs locally. After waking, microphone audio is sent to OpenAI for the conversation, including nearby speech that the microphone picks up. A wake phrase does **not** identify who is speaking: other people or recordings can activate it. Press **Ctrl+C** to stop listening. Timers need the app running and the computer awake; use an independent system for critical deadlines.
+
+Conversation transcripts, responses, and tool arguments are omitted from logs by default. `log_conversation_content: true` enables local content logging for debugging. Logs are restricted to your OS account, but old log contents are not erased by an update. Review logs before sharing them. Timer labels and music history remain in ignored `data/` and `music_cache/` folders. Keep your API key in `.env` and private settings in `config/local.json`.
+
+See [SECURITY.md](SECURITY.md) to report vulnerabilities privately, and the [security review](docs/security-review.md) for scope and remaining limitations. Maintainers can run `make security-deps` followed by `make audit` to check dependencies and Python code. Keep system audio libraries and FFmpeg updated through your package manager as well.
 
 ## Troubleshooting
 
@@ -176,7 +187,7 @@ Start with `./run.sh --doctor`. It checks Python, imports, FFmpeg, prompt files,
 | Music search/download fails | Check connectivity and FFmpeg. YouTube availability can vary; try another track. |
 | Timer did not sound on time | Keep the app running and the computer awake; check the timer status for missed alerts. |
 
-Application logs rotate in `logs/`. Logs can contain transcripts; review them before sharing a bug report. Do not share `.env`.
+Application logs rotate in `logs/`. Content logging is off by default, but errors, older logs, or debug logging can still contain personal information; review them before sharing a bug report. Do not share `.env`.
 
 ## Development and tests
 

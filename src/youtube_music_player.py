@@ -18,8 +18,11 @@ from ytmusicapi import YTMusic
 
 from album_art import AlbumArt
 from configuration import PROJECT_ROOT
+from diagnostics import log_message
 
 logger = logging.getLogger(__name__)
+MAX_SONG_BYTES = 200 * 1024 * 1024
+MAX_SONG_SECONDS = 2 * 60 * 60
 
 
 class YouTubeMusicPlayer:
@@ -56,7 +59,7 @@ class YouTubeMusicPlayer:
         if self.log_function:
             self.log_function(kind, message)
         else:
-            logger.info("[%s] %s", kind, message)
+            logger.info("[%s] %s", kind, log_message(kind, message))
 
     def _refresh_playback(self) -> None:
         # pygame reports not busy while paused, which is not the end of a song.
@@ -172,9 +175,18 @@ class YouTubeMusicPlayer:
 
         cancelled = threading.Event()
 
-        def check_cancelled(_=None):
+        def check_cancelled(progress=None):
             if cancelled.is_set():
                 raise yt_dlp.utils.DownloadError("Download cancelled")
+            if isinstance(progress, dict) and progress.get("downloaded_bytes", 0) > MAX_SONG_BYTES:
+                raise yt_dlp.utils.DownloadError("Song exceeds the 200 MiB download limit")
+
+        def filter_track(info, *, incomplete=False):
+            if info.get("is_live"):
+                return "Live streams are not supported"
+            duration = info.get("duration")
+            if duration is not None and duration > MAX_SONG_SECONDS:
+                return "Songs longer than two hours are not supported"
 
         def download():
             # The worker owns its staging directory even if its awaiting task is cancelled.
@@ -185,6 +197,8 @@ class YouTubeMusicPlayer:
                     "quiet": True,
                     "no_warnings": True,
                     "noplaylist": True,
+                    "max_filesize": MAX_SONG_BYTES,
+                    "match_filter": filter_track,
                     "socket_timeout": 15,
                     "retries": 2,
                     "progress_hooks": [check_cancelled],
@@ -201,6 +215,8 @@ class YouTubeMusicPlayer:
                 result = Path(staging) / "audio.mp3"
                 if not result.is_file() or result.stat().st_size == 0:
                     raise OSError("Download produced no audio")
+                if result.stat().st_size > MAX_SONG_BYTES:
+                    raise OSError("Converted song exceeds the 200 MiB size limit")
                 check_cancelled()
                 result.replace(output_path)
 

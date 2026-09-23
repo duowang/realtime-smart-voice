@@ -74,6 +74,7 @@ def test_create_check_expire_dismiss_and_restart(setup):
         {"duration_seconds": "60"},
         {"duration_seconds": 60, "label": " "},
         {"duration_seconds": 60, "label": 12},
+        {"duration_seconds": 60, "label": "tea\x1b[31m"},
         {"duration_seconds": 60, "extra": "x"},
     ],
 )

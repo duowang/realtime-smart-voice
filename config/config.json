@@ -8,6 +8,7 @@
     "Hi Taco"
   ],
   "wake_word_threshold": 0.1,
+  "log_conversation_content": false,
   "music_volume": 0.35,
   "timer_alert_volume": 0.25,
   "timer_alert_seconds": 10,

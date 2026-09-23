@@ -1,4 +1,4 @@
-.PHONY: setup run doctor dev-deps lint test check benchmark
+.PHONY: setup run doctor dev-deps security-deps audit lint test check benchmark
 
 setup:
 	./run.sh --setup-only
@@ -11,6 +11,13 @@ doctor:
 
 dev-deps:
 	. venv/bin/activate && python -m pip install -r requirements-dev.txt
+
+security-deps:
+	venv/bin/python -m pip install -r requirements-security.txt
+
+audit:
+	venv/bin/python -m pip_audit --progress-spinner off
+	venv/bin/python -m bandit -r src generate_audio.py -ll
 
 lint:
 	. venv/bin/activate && ruff check src tests generate_audio.py

@@ -97,6 +97,7 @@ def tool_response(name, arguments="{}"):
 
 
 def test_stop_music_transcript_reaches_function_handler_once(client):
+    client.log_function = Mock()
     client.websocket = Mock(send=AsyncMock())
     client.music_handler.execute = AsyncMock(return_value={"success": True, "action": "stop"})
 
@@ -116,6 +117,7 @@ def test_stop_music_transcript_reaches_function_handler_once(client):
 
     asyncio.run(run())
     client.music_handler.execute.assert_awaited_once_with("stop_music", {})
+    assert any(c.args == ("TOOL_CALL", "stop_music") for c in client.log_function.call_args_list)
     assert not client.conversation_should_end
     sent = [json.loads(call.args[0])["type"] for call in client.websocket.send.call_args_list]
     assert sent == ["conversation.item.create", "response.create"]
@@ -135,6 +137,28 @@ def test_invalid_function_json_cannot_silently_execute_stop(client):
     client.music_handler.execute = AsyncMock(return_value={"success": False})
     asyncio.run(client._handle_event(tool_response("stop_music", "{")))
     client.music_handler.execute.assert_awaited_once_with("stop_music", None)
+
+
+def test_client_omits_transcripts_and_arguments_from_logs_unless_enabled(client):
+    client.log_function = Mock()
+    client._log("USER_TRANSCRIPT", "private words")
+    client.log_function.assert_called_with("USER_TRANSCRIPT", "[content omitted]")
+    client._log("FUNCTION_CALL", "private arguments")
+    client.log_function.assert_called_with("FUNCTION_CALL", "[content omitted]")
+    client.config["log_conversation_content"] = True
+    client._log("USER_TRANSCRIPT", "private words")
+    client.log_function.assert_called_with("USER_TRANSCRIPT", "private words")
+
+
+def test_streamed_model_text_cannot_emit_terminal_controls(client, capsys):
+    asyncio.run(
+        client._handle_event(
+            {"type": "response.output_text.delta", "delta": "hello\x1b]52;c;payload\x07"}
+        )
+    )
+    text = capsys.readouterr().out
+    assert "hello" in text
+    assert "\x1b" not in text and "\x07" not in text
 
 
 def test_timer_tools_route_to_shared_service_and_outlive_conversation(client, tmp_path):

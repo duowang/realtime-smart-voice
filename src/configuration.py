@@ -42,6 +42,8 @@ def load_config(path: str | Path | None = None) -> dict:
         raise ValueError(f"Cannot read configuration {path}: {error}") from error
     if not isinstance(config, dict):
         raise ValueError("Configuration must be a JSON object")
+    if type(config.get("log_conversation_content", False)) is not bool:
+        raise ValueError("log_conversation_content must be true or false")
     for name, default in TIMEOUT_DEFAULTS.items():
         value = config.setdefault(name, default)
         if (

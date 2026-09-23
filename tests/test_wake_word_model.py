@@ -78,3 +78,13 @@ def test_partial_cache_is_repaired(tmp_path, monkeypatch):
     (cache / model.MODEL_FILES["tokens"]).touch()
     paths = model.ensure_wake_word_model(cache)
     assert all(p.stat().st_size > 0 for p in paths.values())
+
+
+def test_model_download_size_is_bounded_before_extraction(tmp_path, monkeypatch):
+    install_fake_download(monkeypatch)
+    monkeypatch.setattr(model, "MAX_ARCHIVE_BYTES", 1)
+    cache = tmp_path / "model"
+    with pytest.raises(RuntimeError, match="size limit"):
+        model.ensure_wake_word_model(cache)
+    assert not cache.exists()
+    assert not list(tmp_path.iterdir())

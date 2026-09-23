@@ -2,8 +2,9 @@
 .env*
 !.env.example
 
-# Optional personal configuration used with --config
-/config/local.json
+# Personal configurations may contain keys; publish only repository defaults.
+/config/*.json
+!/config/config.json
 
 # Python
 __pycache__/
@@ -32,6 +33,7 @@ MANIFEST
 
 # Virtual environment
 venv/
+.venv/
 env/
 ENV/
 env.bak/
@@ -61,6 +63,10 @@ logs/*.log*
 *.wav
 *.mp3
 *.flac
+*.aiff
+*.m4a
+*.ogg
+*.webm
 test_audio.*
 !audio/hi_there.wav
 !audio/bye_bye.wav

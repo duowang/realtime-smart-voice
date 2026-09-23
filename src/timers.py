@@ -229,6 +229,7 @@ class TimerService:
                     or not 1 <= duration <= MAX_DURATION
                     or not isinstance(label, str)
                     or not 1 <= len(label.strip()) <= 80
+                    or not label.strip().isprintable()
                 ):
                     return self._result(
                         False,

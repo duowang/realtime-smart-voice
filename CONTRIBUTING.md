@@ -73,7 +73,7 @@ Update documentation for new configuration options
 - Use GitHub Issues with the "bug" label
 - Include steps to reproduce
 - Specify your operating system and Python version
-- Include relevant log files from `logs/`
+- Include only relevant, reviewed diagnostic excerpts from `logs/`; remove personal information and keys. Content logging is off by default.
 
 ### 💡 Feature Requests
 - Use GitHub Issues with the "enhancement" label
@@ -147,6 +147,8 @@ Update documentation for new configuration options
 - **Never commit API keys or secrets**
 - **Don't include personal audio recordings**
 - **Be careful with log files that might contain personal data**
+- Report security vulnerabilities through the [private reporting channel in SECURITY.md](SECURITY.md), not a public issue.
+- Run `make security-deps` and `make audit` when changing dependencies or security boundaries. This queries package advisory services; it does not upload source or recordings.
 - **Use environment variables for sensitive configuration**
 
 ## Getting Help
