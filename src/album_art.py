@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import io
 import os
 import re
 import subprocess
@@ -18,6 +19,10 @@ MAX_THUMBNAIL_BYTES = 8 * 1024 * 1024
 MAX_THUMBNAIL_PIXELS = 16_000_000
 THUMBNAIL_HOSTS = ("ytimg.com", "ggpht.com", "googleusercontent.com")
 IMAGE_FORMATS = ("JPEG", "PNG", "WEBP")
+NATIVE_IMAGE_COLUMNS = 32
+NATIVE_IMAGE_ROWS = 16
+KITTY_CHUNK_SIZE = 4096
+KITTY_IMAGE_PIXELS = 640
 
 
 def validate_thumbnail_url(url: str) -> None:
@@ -104,13 +109,24 @@ class AlbumArt:
 
     @staticmethod
     def _is_iterm2() -> bool:
-        """Check whether output terminal is iTerm2."""
-        term_program = os.getenv("TERM_PROGRAM", "")
+        """Check terminals that support iTerm2's inline image protocol."""
+        term_program = os.getenv("TERM_PROGRAM", "").lower()
         lc_terminal = os.getenv("LC_TERMINAL", "")
         return (
-            term_program == "iTerm.app"
+            term_program in {"iterm.app", "wezterm", "vscode"}
             or lc_terminal.lower() == "iterm2"
             or bool(os.getenv("ITERM_SESSION_ID"))
+        )
+
+    @staticmethod
+    def _is_kitty_graphics() -> bool:
+        """Check terminals known to implement the Kitty graphics protocol."""
+        term_program = os.getenv("TERM_PROGRAM", "").lower()
+        term = os.getenv("TERM", "").lower()
+        return (
+            term_program in {"ghostty", "kitty"}
+            or term in {"xterm-ghostty", "xterm-kitty"}
+            or bool(os.getenv("KITTY_WINDOW_ID"))
         )
 
     def _tmux_allows_passthrough(self) -> bool:
@@ -136,7 +152,7 @@ class AlbumArt:
 
         return self._tmux_passthrough
 
-    def _emit_iterm2_inline_image(self, image_path: str, width_percent: int = 70):
+    def _emit_iterm2_inline_image(self, image_path: str, width_columns: int):
         """Emit iTerm2 inline image escape sequence.
 
         Uses tmux passthrough when running inside tmux.
@@ -147,7 +163,7 @@ class AlbumArt:
         name_b64 = base64.b64encode(os.path.basename(image_path).encode("utf-8")).decode("ascii")
         payload = (
             f"\033]1337;File=name={name_b64};inline=1;preserveAspectRatio=1;"
-            f"width={width_percent}%;height=auto:{image_b64}\a"
+            f"width={width_columns};height=auto:{image_b64}\a"
         )
 
         # iTerm2 image escape codes need tmux passthrough wrapping.
@@ -158,12 +174,51 @@ class AlbumArt:
             sys.stdout.write(payload)
         sys.stdout.flush()
 
-    def _render_thumbnail_iterm2(self, thumb_path: str, title: str, artist: str) -> bool:
-        """Render thumbnail via iTerm2's native inline image protocol."""
-        if not self._is_iterm2():
+    @staticmethod
+    def _native_image_size() -> tuple[int, int]:
+        """Keep native artwork compact and inside the current terminal window."""
+        try:
+            terminal = os.get_terminal_size()
+            return (
+                max(1, min(NATIVE_IMAGE_COLUMNS, terminal.columns - 2)),
+                max(1, min(NATIVE_IMAGE_ROWS, terminal.lines - 4)),
+            )
+        except OSError:
+            return NATIVE_IMAGE_COLUMNS, NATIVE_IMAGE_ROWS
+
+    @staticmethod
+    def _emit_kitty_inline_image(image_path: str, columns: int, rows: int) -> None:
+        """Send a bounded PNG using Kitty's chunked direct-transfer protocol."""
+        with Image.open(image_path, formats=IMAGE_FORMATS) as source:
+            image = source.convert("RGB")
+            image.thumbnail((KITTY_IMAGE_PIXELS, KITTY_IMAGE_PIXELS), Image.Resampling.LANCZOS)
+            output = io.BytesIO()
+            image.save(output, format="PNG")
+        encoded = base64.b64encode(output.getvalue()).decode("ascii")
+        for offset in range(0, len(encoded), KITTY_CHUNK_SIZE):
+            chunk = encoded[offset : offset + KITTY_CHUNK_SIZE]
+            more = int(offset + KITTY_CHUNK_SIZE < len(encoded))
+            controls = (
+                f"a=T,f=100,t=d,c={columns},r={rows},q=2,m={more}"
+                if offset == 0
+                else f"m={more},q=2"
+            )
+            sys.stdout.write(f"\033_G{controls};{chunk}\033\\")
+        sys.stdout.flush()
+
+    def _render_thumbnail_native(self, thumb_path: str, title: str, artist: str) -> bool:
+        """Render full-color pixels using the active terminal's image protocol."""
+        protocol = (
+            "iterm" if self._is_iterm2() else "kitty" if self._is_kitty_graphics() else None
+        )
+        if protocol is None:
             return False
 
-        if os.getenv("TMUX") and not self._tmux_allows_passthrough():
+        # Kitty images need more tmux support than simple escape passthrough.
+        if protocol == "kitty" and os.getenv("TMUX"):
+            return False
+
+        if protocol == "iterm" and os.getenv("TMUX") and not self._tmux_allows_passthrough():
             if not self._logged_tmux_passthrough_hint:
                 self._logged_tmux_passthrough_hint = True
                 self._log(
@@ -173,17 +228,22 @@ class AlbumArt:
             return False
 
         try:
+            columns, rows = self._native_image_size()
             print("")  # blank line before
-            self._emit_iterm2_inline_image(thumb_path, width_percent=70)
+            if protocol == "iterm":
+                self._emit_iterm2_inline_image(thumb_path, width_columns=columns)
+            else:
+                self._emit_kitty_inline_image(thumb_path, columns, rows)
+                sys.stdout.write("\r")
             print(f"  \033[1m{title}\033[0m - {artist}")
             print("")  # blank line after
             return True
         except Exception as e:
-            self._log("THUMB_ERROR", f"Failed to render iTerm2 image: {e}")
+            self._log("THUMB_ERROR", f"Failed to render native terminal image: {e}")
             return False
 
     def render(self, thumb_path: str, title: str, artist: str):
-        """Render a thumbnail image in the terminal using ANSI colored half-block characters."""
+        """Render a thumbnail natively or with ANSI colored half-blocks."""
         if not self.is_visible():
             return
         title = "".join(character for character in title if character.isprintable())
@@ -193,8 +253,7 @@ class AlbumArt:
                 raise ValueError("Cached artwork exceeds the size limit")
             with Image.open(thumb_path, formats=IMAGE_FORMATS) as source:
                 check_image_size(source)
-            # Prefer native iTerm2 inline rendering for much higher visual quality.
-            if self._render_thumbnail_iterm2(thumb_path, title, artist):
+            if self._render_thumbnail_native(thumb_path, title, artist):
                 return
 
             with Image.open(thumb_path, formats=IMAGE_FORMATS) as source:

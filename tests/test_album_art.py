@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import io
 from unittest.mock import Mock
 
@@ -53,6 +54,51 @@ def test_redirected_output_never_emits_terminal_sequences(tmp_path, monkeypatch,
     monkeypatch.setattr(AlbumArt, "_is_iterm2", lambda _: True)
     AlbumArt(tmp_path, Mock()).render("missing.jpg", "Title", "Artist")
     assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize(
+    "program,expected",
+    [
+        ("iTerm.app", "iterm"),
+        ("WezTerm", "iterm"),
+        ("vscode", "iterm"),
+        ("ghostty", "kitty"),
+        ("kitty", "kitty"),
+        ("Apple_Terminal", None),
+    ],
+)
+def test_native_image_protocol_selection(tmp_path, monkeypatch, program, expected):
+    monkeypatch.setenv("TERM_PROGRAM", program)
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.delenv("ITERM_SESSION_ID", raising=False)
+    monkeypatch.delenv("KITTY_WINDOW_ID", raising=False)
+    monkeypatch.delenv("LC_TERMINAL", raising=False)
+    monkeypatch.delenv("TMUX", raising=False)
+    art = AlbumArt(tmp_path, Mock())
+    thumb = tmp_path / "cover.jpg"
+    Image.new("RGB", (100, 100), "red").save(thumb)
+    emitted = []
+    monkeypatch.setattr(art, "_emit_iterm2_inline_image", lambda *_args, **_kwargs: emitted.append("iterm"))
+    monkeypatch.setattr(art, "_emit_kitty_inline_image", lambda *_args: emitted.append("kitty"))
+    assert art._render_thumbnail_native(str(thumb), "Title", "Artist") is (expected is not None)
+    assert emitted == ([expected] if expected else [])
+
+
+def test_kitty_image_is_chunked_png_with_bounded_dimensions(tmp_path, monkeypatch, capsys):
+    thumb = tmp_path / "cover.jpg"
+    Image.new("RGB", (1400, 1400), "red").save(thumb)
+    monkeypatch.setattr(module, "KITTY_CHUNK_SIZE", 64)
+
+    AlbumArt._emit_kitty_inline_image(str(thumb), 32, 16)
+    output = capsys.readouterr().out
+    chunks = output.split("\033\\")
+    assert chunks[-1] == ""
+    assert chunks[0].startswith("\033_Ga=T,f=100,t=d,c=32,r=16,q=2,m=1;")
+    assert chunks[-2].startswith("\033_Gm=0,q=2;")
+    encoded = "".join(chunk.split(";", 1)[1] for chunk in chunks[:-1])
+    with Image.open(io.BytesIO(base64.b64decode(encoded))) as image:
+        assert image.format == "PNG"
+        assert image.size == (640, 640)
 
 
 @pytest.mark.parametrize(

@@ -101,6 +101,8 @@ Start each interaction with **“Hi Taco”** (or your chosen wake phrase) and w
 
 Saying “Hi Taco” pauses music for the conversation. Music resumes afterward unless you explicitly pause or stop it. Songs and artwork are cached in `music_cache/`; artwork loading does not delay playback. There is one current track and no playlist queue.
 
+Album covers use full-color inline images in iTerm2, WezTerm, Ghostty, Kitty, and the VS Code terminal. Other terminals use a lower-resolution ANSI rendering because text cells cannot show the source image's detail. The cached `music_cache/*_thumb.jpg` files retain the high-resolution artwork and can be opened in an image viewer. Inside tmux, Kitty-style images fall back to ANSI; iTerm-style images require `allow-passthrough on`.
+
 Playback defaults to 35% volume to help the microphone hear the wake phrase. Loud music can still mask speech; acoustic echo cancellation is not implemented. Lower `music_volume` or move the microphone farther from the speakers if wake detection becomes unreliable.
 
 Live streams and tracks with a known duration over two hours are rejected. Downloads and converted tracks are limited to 200 MiB each. The cache has no automatic eviction; remove unwanted cached tracks while the app is stopped to reclaim disk space.
